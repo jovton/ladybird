@@ -35,6 +35,11 @@ if (APPLE OR LINUX)
     ladybird_test(TestRustCrateCopies.cpp LibGfx LIBS LibGfx LibWeb)
 endif()
 
+if (USE_VULKAN_DMABUF_IMAGES)
+    ladybird_test(TestVulkanContext.cpp LibGfx LIBS LibGfx LibCore)
+    ladybird_test(TestVulkanImage.cpp LibGfx LIBS LibGfx)
+endif()
+
 if (APPLE)
     ladybird_test(TestVideoSurfaceImage.mm LibGfx LIBS LibGfx skia)
     target_link_libraries(TestVideoSurfaceImage PRIVATE "-framework CoreVideo")
