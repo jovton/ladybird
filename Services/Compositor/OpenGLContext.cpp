@@ -66,6 +66,12 @@ struct OpenGLContext::Impl {
 #endif
 
     RefPtr<Gfx::Bitmap> readback_bitmap {};
+
+    // WebGL 2 contexts read their drawing buffer back into this pixel pack buffer without waiting for the GPU, see
+    // present_asynchronously().
+    GLuint readback_buffer { 0 };
+    Gfx::IntSize readback_buffer_size {};
+    bool readback_pending { false };
 };
 
 OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
@@ -103,6 +109,13 @@ void OpenGLContext::free_surface_resources()
     if (m_impl->depth_buffer) {
         glDeleteRenderbuffers(1, &m_impl->depth_buffer);
         m_impl->depth_buffer = 0;
+    }
+
+    if (m_impl->readback_buffer) {
+        glDeleteBuffers(1, &m_impl->readback_buffer);
+        m_impl->readback_buffer = 0;
+        m_impl->readback_buffer_size = {};
+        m_impl->readback_pending = false;
     }
 
 #    ifdef USE_VULKAN_DMABUF_IMAGES
@@ -491,15 +504,20 @@ void OpenGLContext::allocate_cpu_painting_surface()
     glViewport(0, 0, m_size.width(), m_size.height());
 }
 
-void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
+Gfx::Bitmap& OpenGLContext::readback_bitmap()
 {
-    VERIFY(m_impl->uses_cpu_painting_surface);
-    VERIFY(m_painting_surface);
-
     // The pixels only pass through this bitmap on their way into the painting surface, so it can be reused.
     auto& bitmap = m_impl->readback_bitmap;
     if (!bitmap || bitmap->size() != m_size)
         bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Premultiplied, m_size));
+    return *bitmap;
+}
+
+// Reads the drawing buffer, bottom row first and tightly packed, into destination, or into the given pixel pack buffer at
+// the offset that destination stands for. The page's framebuffer binding and pixel pack state are left as they were.
+void OpenGLContext::read_default_framebuffer(u32 pixel_pack_buffer, void* destination)
+{
+    VERIFY(pixel_pack_buffer == 0 || m_webgl_version == WebGLVersion::WebGL2);
 
     GLenum framebuffer_target = GL_FRAMEBUFFER;
     GLenum framebuffer_binding = GL_FRAMEBUFFER_BINDING;
@@ -529,7 +547,7 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     GLint original_pack_skip_rows = 0;
     if (m_webgl_version == WebGLVersion::WebGL2) {
         glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pixel_pack_buffer);
 
         glGetIntegerv(GL_PACK_ROW_LENGTH, &original_pack_row_length);
         glGetIntegerv(GL_PACK_SKIP_PIXELS, &original_pack_skip_pixels);
@@ -539,19 +557,9 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
         glPixelStorei(GL_PACK_SKIP_ROWS, 0);
     }
 
-    // Read all rows with one call: each glReadPixels waits for the GPU and copies the pixels back, which is slow with a
-    // hardware driver. The pack state above makes GL write the rows tightly packed, like the bitmap stores them.
-    auto row_size = static_cast<size_t>(m_size.width()) * 4;
-    VERIFY(bitmap->pitch() == row_size);
-    glReadPixels(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, bitmap->scanline_u8(0));
-
-    // GL's rows go from bottom to top, so flip them.
-    auto spare_row = MUST(ByteBuffer::create_uninitialized(row_size));
-    for (int top = 0, bottom = m_size.height() - 1; top < bottom; ++top, --bottom) {
-        memcpy(spare_row.data(), bitmap->scanline_u8(top), row_size);
-        memcpy(bitmap->scanline_u8(top), bitmap->scanline_u8(bottom), row_size);
-        memcpy(bitmap->scanline_u8(bottom), spare_row.data(), row_size);
-    }
+    // Read all rows with one call: reading back into client memory waits for the GPU, which is slow with a hardware
+    // driver.
+    glReadPixels(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, destination);
 
     if (m_webgl_version == WebGLVersion::WebGL2) {
         glPixelStorei(GL_PACK_ROW_LENGTH, original_pack_row_length);
@@ -564,8 +572,30 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     glBindFramebuffer(framebuffer_target, original_framebuffer);
     if (m_webgl_version == WebGLVersion::WebGL2)
         glReadBuffer(original_read_buffer);
+}
 
-    m_painting_surface->write_from_bitmap(*bitmap);
+void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
+{
+    VERIFY(m_impl->uses_cpu_painting_surface);
+    VERIFY(m_painting_surface);
+
+    // This reads the current frame, which supersedes one that is still being read back asynchronously.
+    m_impl->readback_pending = false;
+
+    auto& bitmap = readback_bitmap();
+    auto row_size = static_cast<size_t>(m_size.width()) * 4;
+    VERIFY(bitmap.pitch() == row_size);
+    read_default_framebuffer(0, bitmap.scanline_u8(0));
+
+    // GL's rows go from bottom to top, so flip them.
+    auto spare_row = MUST(ByteBuffer::create_uninitialized(row_size));
+    for (int top = 0, bottom = m_size.height() - 1; top < bottom; ++top, --bottom) {
+        memcpy(spare_row.data(), bitmap.scanline_u8(top), row_size);
+        memcpy(bitmap.scanline_u8(top), bitmap.scanline_u8(bottom), row_size);
+        memcpy(bitmap.scanline_u8(bottom), spare_row.data(), row_size);
+    }
+
+    m_painting_surface->write_from_bitmap(bitmap);
 }
 #endif
 
@@ -634,6 +664,7 @@ void OpenGLContext::set_size(Gfx::IntSize const& size)
 {
     if (m_size != size) {
         m_painting_surface = nullptr;
+        m_impl->readback_pending = false;
     }
     m_size = size;
 }
@@ -660,7 +691,8 @@ void OpenGLContext::present()
         // (d3d12_bo_new() calls d3d12_screen_reclaim_completed() inside pb_slab_manager_create_buffer()). Freeing the
         // previous readback's staging buffer then takes that same lock, and the Compositor hangs. Submitting the frame
         // first frees those buffers with no lock held. It doesn't help when nothing was drawn since the last readback,
-        // as there's nothing to submit then.
+        // as there's nothing to submit then. The asynchronous readback isn't affected, since Mesa never puts a pixel pack
+        // buffer in a slab.
         glFlush();
         copy_default_framebuffer_to_cpu_painting_surface();
         return;
@@ -677,6 +709,67 @@ void OpenGLContext::present()
     // FIXME: CPU sync for now, but it would be better to export a fence and have Skia wait for it before reading from the surface
     glFinish();
 #    endif
+#endif
+}
+
+bool OpenGLContext::present_asynchronously()
+{
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    // Reading the frame back into client memory would block the Compositor until the GPU has finished it. A pixel pack
+    // buffer (which needs OpenGL ES 3, so WebGL 2) lets the GPU make the copy, to be picked up once the frame is needed.
+    if (m_impl->uses_cpu_painting_surface && m_webgl_version == WebGLVersion::WebGL2) {
+        make_current();
+        if (!m_impl->readback_buffer)
+            glGenBuffers(1, &m_impl->readback_buffer);
+        if (m_impl->readback_buffer_size != m_size) {
+            GLint original_pixel_pack_buffer = 0;
+            glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, m_impl->readback_buffer);
+            glBufferData(GL_PIXEL_PACK_BUFFER, static_cast<GLsizeiptr>(m_size.width()) * m_size.height() * 4, nullptr, GL_STREAM_READ);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
+            m_impl->readback_buffer_size = m_size;
+        }
+        read_default_framebuffer(m_impl->readback_buffer, nullptr);
+        glFlush();
+        m_impl->readback_pending = true;
+        return true;
+    }
+#endif
+    present();
+    return false;
+}
+
+void OpenGLContext::finish_asynchronous_present()
+{
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    if (!m_impl->readback_pending)
+        return;
+    m_impl->readback_pending = false;
+    make_current();
+    VERIFY(m_painting_surface);
+
+    auto& bitmap = readback_bitmap();
+    auto row_size = static_cast<size_t>(m_size.width()) * 4;
+
+    GLint original_pixel_pack_buffer = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, m_impl->readback_buffer);
+
+    // Mapping the buffer waits for the copy into it, if the GPU hasn't made it yet.
+    auto const* pixels = static_cast<u8 const*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, static_cast<GLsizeiptr>(row_size) * m_size.height(), GL_MAP_READ_BIT));
+    if (pixels) {
+        // GL's rows go from bottom to top, so flip them on the way into the bitmap.
+        for (int source_y = 0; source_y < m_size.height(); ++source_y)
+            memcpy(bitmap.scanline_u8(m_size.height() - source_y - 1), pixels + source_y * row_size, row_size);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
+
+    if (!pixels) {
+        dbgln("Compositor: Could not map the buffer a WebGL frame was read back into");
+        return;
+    }
+    m_painting_surface->write_from_bitmap(bitmap);
 #endif
 }
 

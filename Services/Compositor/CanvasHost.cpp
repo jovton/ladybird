@@ -238,6 +238,14 @@ void CanvasHost::present_webgl_canvas(Compositing::CanvasId canvas_id, bool pres
 
     auto surface = MUST(as_webgl(*context).prepare_for_compositing(preserve_drawing_buffer));
     m_canvas_surface_registry.set_canvas_surface(canvas_id, move(surface));
+
+    // The frame's pixels only reach the surface once something looks it up, so the GPU can make the copy in the meantime.
+    m_canvas_surface_registry.set_pending_content_resolver(canvas_id, [this, canvas_id] {
+        if (auto* context = this->context(canvas_id)) {
+            if (auto* webgl_context = context->get_pointer<WebGLContext>())
+                (*webgl_context)->finish_pending_present();
+        }
+    });
 }
 
 void CanvasHost::clear_webgl_drawing_buffer(Compositing::CanvasId canvas_id)
@@ -275,6 +283,8 @@ RefPtr<Gfx::PaintingSurface> CanvasHost::presented_surface(Compositing::CanvasId
             return canvas_context.presented_surface;
         },
         [](WebGLContext& webgl_context) -> RefPtr<Gfx::PaintingSurface> {
+            // The presented frame may still be on its way back from the GPU.
+            webgl_context->finish_pending_present();
             return webgl_context->surface();
         });
 }

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+<link rel="match" href="../expected/webgl2-canvas-bands-ref.html">
+<style>
+    body {
+        margin: 0;
+    }
+    canvas {
+        display: block;
+    }
+</style>
+<canvas id="canvas" width="120" height="90"></canvas>
+<script>
+    // Three bands, from the top: red, lime and blue. GL counts rows from the bottom.
+    const gl = canvas.getContext("webgl2");
+    gl.enable(gl.SCISSOR_TEST);
+    [[0, 0, 1], [0, 1, 0], [1, 0, 0]].forEach(([red, green, blue], index) => {
+        gl.scissor(0, index * 30, 120, 30);
+        gl.clearColor(red, green, blue, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+    });
+
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            if (window.internals)
+                internals.signalTestIsDone("PASS");
+            else
+                document.documentElement.classList.remove("reftest-wait");
+        });
+    });
+</script>
