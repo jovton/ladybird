@@ -639,24 +639,43 @@ void OpenGLContext::allocate_painting_surface_if_needed()
     glBindFramebuffer(GL_FRAMEBUFFER, m_impl->framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_impl->texture_target == EGL_TEXTURE_RECTANGLE_ANGLE ? GL_TEXTURE_RECTANGLE_ANGLE : GL_TEXTURE_2D, m_impl->color_buffer, 0);
 
-    if (m_drawing_buffer_options.depth || m_drawing_buffer_options.stencil) {
+    auto stencil = m_drawing_buffer_options.stencil && drawing_buffer_can_have_stencil();
+    if (m_drawing_buffer_options.depth || stencil) {
         glGenRenderbuffers(1, &m_impl->depth_buffer);
         glBindRenderbuffer(GL_RENDERBUFFER, m_impl->depth_buffer);
 
-        if (m_drawing_buffer_options.depth && m_drawing_buffer_options.stencil) {
+        if (m_drawing_buffer_options.depth && stencil) {
             glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, m_size.width(), m_size.height());
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
         } else if (m_drawing_buffer_options.depth) {
             glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, m_size.width(), m_size.height());
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
         } else {
-            VERIFY(m_drawing_buffer_options.stencil);
+            VERIFY(stencil);
             glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, m_size.width(), m_size.height());
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
         }
     }
 
     VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+#endif
+}
+
+bool OpenGLContext::drawing_buffer_can_have_stencil()
+{
+#ifdef ENABLE_WEBGL
+    // With Mesa's d3d12 driver on WSL2 (seen with Mesa 26.2 on an Intel GPU), the first draw with the stencil test
+    // enabled on a framebuffer that has a stencil buffer removes the GPU device: nothing gets drawn from then on, in any
+    // WebGL context of the process. Without a stencil buffer, the stencil test just passes, so leave it out there.
+    // FIXME: Pages can still attach stencil buffers to framebuffers of their own and trigger the same. Detect the lost
+    //        device instead (create the contexts with EGL_LOSE_CONTEXT_ON_RESET_EXT and check
+    //        glGetGraphicsResetStatusEXT() after each frame), and let the browser restart the Compositor, which makes
+    //        pages see webglcontextlost. Application::recover_compositor_process() crashes the browser after three
+    //        restarts, though, so a page that keeps doing this would need to be stopped before then.
+    auto const* renderer = reinterpret_cast<char const*>(glGetString(GL_RENDERER));
+    return !renderer || !StringView { renderer, strlen(renderer) }.contains("D3D12"sv);
+#else
+    return true;
 #endif
 }
 

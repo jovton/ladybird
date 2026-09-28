@@ -78,6 +78,7 @@ private:
     [[maybe_unused]] DrawingBufferOptions m_drawing_buffer_options;
 
     void free_surface_resources();
+    bool drawing_buffer_can_have_stencil();
 #if defined(AK_OS_MACOS)
     void allocate_iosurface_painting_surface();
 #endif
