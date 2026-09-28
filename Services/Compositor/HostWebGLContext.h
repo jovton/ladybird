@@ -48,6 +48,8 @@ public:
     bool read_buffer_sub_data(Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer data);
     ErrorOr<NonnullRefPtr<Gfx::PaintingSurface>> prepare_for_compositing(bool preserve_drawing_buffer);
     void clear_drawing_buffer();
+    // Brings the surface up to date with the frame that prepare_for_compositing() presented.
+    void finish_pending_present();
     RefPtr<Gfx::PaintingSurface> surface();
 
     OpenGLContext& gl_context() { return *m_gl_context; }
