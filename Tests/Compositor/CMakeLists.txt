@@ -18,3 +18,7 @@ if (APPLE)
     ladybird_test(TestVideoSurfaceImage.mm Compositor LIBS compositorservice LibCompositing LibGfx skia)
     target_link_libraries(TestVideoSurfaceImage PRIVATE "-framework CoreVideo")
 endif()
+
+if (USE_VULKAN_DMABUF_IMAGES)
+    ladybird_test("TestOpenGLContext.cpp" Compositor LIBS compositorservice LibCompositing LibGfx ${ANGLE_TARGETS})
+endif()
