@@ -52,6 +52,11 @@ public:
 
     void present();
 
+    // Like present(), except that a WebGL 2 context doesn't wait for the GPU to finish the frame: it gets copied into a
+    // buffer, and only reaches the painting surface in finish_asynchronous_present(). Returns whether that's pending.
+    bool present_asynchronously();
+    void finish_asynchronous_present();
+
     void set_size(Gfx::IntSize const&);
 
     RefPtr<Gfx::PaintingSurface> surface();
@@ -82,6 +87,8 @@ private:
 #if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
     void allocate_cpu_painting_surface();
     void copy_default_framebuffer_to_cpu_painting_surface();
+    void read_default_framebuffer(u32 pixel_pack_buffer, void* destination);
+    Gfx::Bitmap& readback_bitmap();
 #endif
 };
 
