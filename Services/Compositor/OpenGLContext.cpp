@@ -64,6 +64,8 @@ struct OpenGLContext::Impl {
         PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_dma_buf_modifiers { nullptr };
     } ext_procs;
 #endif
+
+    RefPtr<Gfx::Bitmap> readback_bitmap {};
 };
 
 OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
@@ -494,7 +496,10 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     VERIFY(m_impl->uses_cpu_painting_surface);
     VERIFY(m_painting_surface);
 
-    auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Premultiplied, m_size));
+    // The pixels only pass through this bitmap on their way into the painting surface, so it can be reused.
+    auto& bitmap = m_impl->readback_bitmap;
+    if (!bitmap || bitmap->size() != m_size)
+        bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Premultiplied, m_size));
 
     GLenum framebuffer_target = GL_FRAMEBUFFER;
     GLenum framebuffer_binding = GL_FRAMEBUFFER_BINDING;
@@ -646,25 +651,31 @@ void OpenGLContext::present()
 #ifdef ENABLE_WEBGL
     make_current();
 
+#    if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    if (m_impl->uses_cpu_painting_surface) {
+        // Reading the drawing buffer back waits for all rendering to it to finish, so it needs no glFinish(). The glFlush()
+        // works around a deadlock in the d3d12 driver of Mesa 26.2 (which WSL2 uses): reading back 32 to 64 KiB, like a
+        // 100x100 canvas, gets a staging buffer that takes up a whole slab, so the next readback needs a new slab. While
+        // creating it, the driver frees the buffers the GPU is done with, still holding the slab allocator's lock
+        // (d3d12_bo_new() calls d3d12_screen_reclaim_completed() inside pb_slab_manager_create_buffer()). Freeing the
+        // previous readback's staging buffer then takes that same lock, and the Compositor hangs. Submitting the frame
+        // first frees those buffers with no lock held. It doesn't help when nothing was drawn since the last readback,
+        // as there's nothing to submit then.
+        glFlush();
+        copy_default_framebuffer_to_cpu_painting_surface();
+        return;
+    }
+#    endif
+
     // "Before the drawing buffer is presented for compositing the implementation shall ensure that all rendering operations have been flushed to the drawing buffer."
     // With Metal, glFlush flushes the command buffer, but without waiting for it to be scheduled or completed.
     // eglWaitUntilWorkScheduledANGLE flushes the command buffer, and waits until it has been scheduled, hence the name.
     // eglWaitUntilWorkScheduledANGLE only has an effect on CGL and Metal backends, so we only use it on macOS.
 #    if defined(AK_OS_MACOS)
-    if (m_impl->uses_cpu_painting_surface)
-        glFinish();
-    else
-        eglWaitUntilWorkScheduledANGLE(m_impl->display);
+    eglWaitUntilWorkScheduledANGLE(m_impl->display);
 #    elif defined(USE_VULKAN_DMABUF_IMAGES)
     // FIXME: CPU sync for now, but it would be better to export a fence and have Skia wait for it before reading from the surface
     glFinish();
-#    elif (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(AK_OS_WINDOWS)
-    glFinish();
-#    endif
-
-#    if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
-    if (m_impl->uses_cpu_painting_surface)
-        copy_default_framebuffer_to_cpu_painting_surface();
 #    endif
 #endif
 }
