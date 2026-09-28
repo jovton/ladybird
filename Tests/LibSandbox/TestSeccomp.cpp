@@ -227,7 +227,8 @@ TEST_CASE(gpu_policy_allows_graphics_ioctl_families)
 
 TEST_CASE(gpu_policy_does_not_allow_unrelated_ioctls)
 {
-    for (auto request : Array<unsigned long, 3> { TIOCSTI, _IO('f', 2), _IO('X', 0) }) {
+    // WSL's GPU ioctls ('G') are only allowed by allow_wsl_gpu_device_operations().
+    for (auto request : Array<unsigned long, 4> { TIOCSTI, _IO('f', 2), _IO('X', 0), _IO('G', 0) }) {
         auto status = run_with_policy(
             [](auto& policy) { policy.allow_gpu_device_operations(); },
             [&] { (void)ioctl(-1, request, nullptr); });
@@ -235,6 +236,23 @@ TEST_CASE(gpu_policy_does_not_allow_unrelated_ioctls)
         if (WIFEXITED(status))
             EXPECT_EQ(WEXITSTATUS(status), 128 + SIGSYS);
     }
+}
+
+TEST_CASE(wsl_gpu_policy_allows_dxg_ioctls)
+{
+    auto status = run_with_policy(
+        [](auto& policy) {
+            policy.allow_gpu_device_operations();
+            policy.allow_wsl_gpu_device_operations();
+        },
+        [] {
+            // EBADF proves the request reached the kernel without requiring WSL.
+            VERIFY(ioctl(-1, _IO('G', 0), nullptr) == -1);
+            VERIFY(errno == EBADF);
+        });
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST_CASE(filesystem_write_policy_refuses_timestamp_changes_outside_landlock)
