@@ -21,6 +21,7 @@ extern "C" {
 #include <EGL/eglext_angle.h>
 }
 
+#include <AK/ByteBuffer.h>
 #include <AK/HashMap.h>
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
@@ -533,8 +534,19 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
         glPixelStorei(GL_PACK_SKIP_ROWS, 0);
     }
 
-    for (int source_y = 0; source_y < m_size.height(); ++source_y)
-        glReadPixels(0, source_y, m_size.width(), 1, GL_RGBA, GL_UNSIGNED_BYTE, bitmap->scanline_u8(m_size.height() - source_y - 1));
+    // Read all rows with one call: each glReadPixels waits for the GPU and copies the pixels back, which is slow with a
+    // hardware driver. The pack state above makes GL write the rows tightly packed, like the bitmap stores them.
+    auto row_size = static_cast<size_t>(m_size.width()) * 4;
+    VERIFY(bitmap->pitch() == row_size);
+    glReadPixels(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, bitmap->scanline_u8(0));
+
+    // GL's rows go from bottom to top, so flip them.
+    auto spare_row = MUST(ByteBuffer::create_uninitialized(row_size));
+    for (int top = 0, bottom = m_size.height() - 1; top < bottom; ++top, --bottom) {
+        memcpy(spare_row.data(), bitmap->scanline_u8(top), row_size);
+        memcpy(bitmap->scanline_u8(top), bitmap->scanline_u8(bottom), row_size);
+        memcpy(bitmap->scanline_u8(bottom), spare_row.data(), row_size);
+    }
 
     if (m_webgl_version == WebGLVersion::WebGL2) {
         glPixelStorei(GL_PACK_ROW_LENGTH, original_pack_row_length);
