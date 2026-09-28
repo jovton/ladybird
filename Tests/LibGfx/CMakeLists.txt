@@ -33,3 +33,9 @@ ladybird_test(TestPaintingSurface.cpp LibGfx LIBS LibGfx skia)
 if (APPLE OR LINUX)
     ladybird_test(TestRustCrateCopies.cpp LibGfx LIBS LibGfx LibWeb)
 endif()
+
+if (USE_VULKAN_DMABUF_IMAGES)
+    ladybird_test(TestVulkanContext.cpp LibGfx LIBS LibGfx LibCore Vulkan::Vulkan)
+    ladybird_test(TestVulkanImage.cpp LibGfx LIBS LibGfx)
+endif()
+

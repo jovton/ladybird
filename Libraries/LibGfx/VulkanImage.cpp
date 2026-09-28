@@ -98,6 +98,9 @@ int VulkanImage::get_dma_buf_fd() const
 
 ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers)
 {
+    if (!context.supports_dmabuf_images)
+        return Error::from_string_literal("Vulkan device does not support DMA-BUF images");
+
     VkDrmFormatModifierPropertiesListEXT format_mod_props_list = {};
     format_mod_props_list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
     format_mod_props_list.pNext = nullptr;

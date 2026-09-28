@@ -157,6 +157,17 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
     bool use_cpu_painting_surface = false;
 #    endif
 
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+    // The drawing buffer can only be shared with Skia's Vulkan device as a DMA-BUF, which not every device supports.
+    if (skia_backend_context && !skia_backend_context->vulkan_context().supports_dmabuf_images) {
+#        ifdef ENABLE_WEBGL_CPU_PAINTING_SURFACE
+        use_cpu_painting_surface = true;
+#        else
+        return {};
+#        endif
+    }
+#    endif
+
 #    if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES)
     if (!use_cpu_painting_surface && !skia_backend_context)
         return {};
