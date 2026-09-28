@@ -42,6 +42,37 @@ static void shut_down_egl_at_exit(EGLDisplay display)
     });
 }
 
+TEST_CASE(small_webgl_frames_can_be_presented_one_after_another)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL1, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+
+    // With Mesa's d3d12 driver, reading back a drawing buffer this size could hang the second time, see OpenGLContext::present().
+    // That only happens while the driver has no free buffer of that size cached yet, which is why this test comes first.
+    Gfx::IntSize size { 100, 100 };
+    context->set_size(size);
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    for (int frame = 1; frame <= 3; ++frame) {
+        context->make_current();
+        glBindFramebuffer(GL_FRAMEBUFFER, context->default_framebuffer());
+        glClearColor(static_cast<float>(frame * 80) / 255, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        context->present();
+    }
+
+    auto surface = context->surface();
+    EXPECT(surface);
+    if (surface) {
+        auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, size));
+        surface->read_into_bitmap(*bitmap);
+        EXPECT_EQ(bitmap->get_pixel(50, 50), Gfx::Color(240, 0, 0));
+    }
+}
+
 // Paints each row of the drawing buffer its own color, and checks that it reaches the painting surface the right way up.
 // Returns the EGL display the context used.
 static EGLDisplay check_webgl_rows_reach_the_painting_surface(RefPtr<Gfx::SkiaBackendContext> backend)
