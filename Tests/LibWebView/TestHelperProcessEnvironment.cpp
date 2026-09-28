@@ -56,6 +56,7 @@ TEST_CASE(helper_environment_gives_each_helper_only_its_own_configuration)
 {
     MUST(Core::Environment::set("PULSE_SERVER"sv, "unix:/run/user/1000/pulse/native"sv, Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("MESA_SHADER_CACHE_DIR"sv, "/tmp/mesa"sv, Core::Environment::Overwrite::Yes));
+    MUST(Core::Environment::set("GALLIUM_DRIVER"sv, "d3d12"sv, Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("VK_ICD_FILENAMES"sv, "/usr/share/vulkan/icd.d/radeon_icd.json"sv, Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("SSL_CERT_FILE"sv, "/etc/ssl/cert.pem"sv, Core::Environment::Overwrite::Yes));
 
@@ -63,6 +64,7 @@ TEST_CASE(helper_environment_gives_each_helper_only_its_own_configuration)
     auto web_content_environment = WebView::Process::helper_process_environment(WebView::ProcessType::WebContent);
     EXPECT(web_content_environment.contains_slow("PULSE_SERVER=unix:/run/user/1000/pulse/native"sv));
     EXPECT(!web_content_environment.contains_slow("MESA_SHADER_CACHE_DIR=/tmp/mesa"sv));
+    EXPECT(!web_content_environment.contains_slow("GALLIUM_DRIVER=d3d12"sv));
     EXPECT(!web_content_environment.contains_slow("SSL_CERT_FILE=/etc/ssl/cert.pem"sv));
     auto media_server_environment = WebView::Process::helper_process_environment(WebView::ProcessType::MediaServer);
     EXPECT(media_server_environment.contains_slow("PULSE_SERVER=unix:/run/user/1000/pulse/native"sv));
@@ -74,6 +76,7 @@ TEST_CASE(helper_environment_gives_each_helper_only_its_own_configuration)
     // Only the Compositor talks to the GPU driver.
     auto compositor_environment = WebView::Process::helper_process_environment(WebView::ProcessType::Compositor);
     EXPECT(compositor_environment.contains_slow("MESA_SHADER_CACHE_DIR=/tmp/mesa"sv));
+    EXPECT(compositor_environment.contains_slow("GALLIUM_DRIVER=d3d12"sv));
     EXPECT(compositor_environment.contains_slow("VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json"sv));
     EXPECT(!compositor_environment.contains_slow("PULSE_SERVER=unix:/run/user/1000/pulse/native"sv));
 
