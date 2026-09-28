@@ -1852,6 +1852,19 @@ void SeccompPolicy::allow_gpu_device_operations()
 #endif
 }
 
+void SeccompPolicy::allow_wsl_gpu_device_operations()
+{
+    // WSL's /dev/dxg (dxgkrnl), which Mesa's Direct3D 12 based drivers use to reach the GPU. Other
+    // drivers use the same ioctl type, including a terminal multiplexer, so this is kept out of the
+    // GPU policy for systems without that device.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, _IOC_TYPEMASK << _IOC_TYPESHIFT));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<u32>('G') << _IOC_TYPESHIFT, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+}
+
 void SeccompPolicy::allow_process_metadata()
 {
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getpid);

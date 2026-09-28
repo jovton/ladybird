@@ -171,6 +171,8 @@ ErrorOr<void> restrict_filesystem(StringView resource_root)
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/vulkan"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/dri"sv, Sandbox::LandlockPath::Access::ReadWrite));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/udmabuf"sv, Sandbox::LandlockPath::Access::ReadWrite));
+    // WSL's GPU interface, which Mesa's Direct3D 12 based drivers use.
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/dxg"sv, Sandbox::LandlockPath::Access::ReadWrite));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/sys"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/ld.so.cache"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/egl"sv, Sandbox::LandlockPath::Access::ReadOnly));
@@ -235,6 +237,8 @@ ErrorOr<void> apply_sandbox(StringView, StringView, StringView)
     policy.allow_ipc();
     policy.allow_socket_pairs();
     policy.allow_gpu_device_operations();
+    if (!Core::System::access("/dev/dxg"sv, F_OK).is_error())
+        policy.allow_wsl_gpu_device_operations();
     policy.allow_common_runtime();
     policy.allow_executable_memory_mappings();
     // Some GPU drivers allocate writable executable code heaps lazily after
