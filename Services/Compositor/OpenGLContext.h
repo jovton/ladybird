@@ -64,6 +64,12 @@ public:
     u32 default_framebuffer() const;
     u32 default_renderbuffer() const;
 
+    // Works around a driver bug before passing the call on to GL, see the definition.
+    void blit_framebuffer(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter);
+    void renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
+    void renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
+    void framebuffer_renderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
+
     Vector<String> get_supported_opengl_extensions();
 
 private:
@@ -79,6 +85,9 @@ private:
 
     void free_surface_resources();
     bool drawing_buffer_can_have_stencil();
+    bool uses_mesa_d3d12();
+    bool read_framebuffer_has_unresolvable_depth();
+    GLenum renderbuffer_format_for(GLenum);
 #if defined(AK_OS_MACOS)
     void allocate_iosurface_painting_surface();
 #endif
