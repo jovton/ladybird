@@ -72,6 +72,11 @@ struct OpenGLContext::Impl {
     GLuint readback_buffer { 0 };
     Gfx::IntSize readback_buffer_size {};
     bool readback_pending { false };
+
+    Optional<bool> uses_mesa_d3d12 {};
+
+    // Renderbuffers that the page gave a stencil format, but that got a depth-only one instead, see renderbuffer_storage().
+    HashMap<GLuint, GLenum> renderbuffers_without_stencil {};
 };
 
 OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
@@ -667,15 +672,138 @@ bool OpenGLContext::drawing_buffer_can_have_stencil()
     // With Mesa's d3d12 driver on WSL2 (seen with Mesa 26.2 on an Intel GPU), the first draw with the stencil test
     // enabled on a framebuffer that has a stencil buffer removes the GPU device: nothing gets drawn from then on, in any
     // WebGL context of the process. Without a stencil buffer, the stencil test just passes, so leave it out there.
-    // FIXME: Pages can still attach stencil buffers to framebuffers of their own and trigger the same. Detect the lost
-    //        device instead (create the contexts with EGL_LOSE_CONTEXT_ON_RESET_EXT and check
-    //        glGetGraphicsResetStatusEXT() after each frame), and let the browser restart the Compositor, which makes
-    //        pages see webglcontextlost. Application::recover_compositor_process() crashes the browser after three
-    //        restarts, though, so a page that keeps doing this would need to be stopped before then.
-    auto const* renderer = reinterpret_cast<char const*>(glGetString(GL_RENDERER));
-    return !renderer || !StringView { renderer, strlen(renderer) }.contains("D3D12"sv);
+    // Framebuffers of the page's own get the same treatment, see renderbuffer_format_for().
+    // FIXME: Other operations can remove the device as well, like resolving multisampled depth (see blit_framebuffer()).
+    //        Detecting a lost device (create the contexts with EGL_LOSE_CONTEXT_ON_RESET_EXT and check
+    //        glGetGraphicsResetStatusEXT() after each frame) and letting the browser restart the Compositor would make
+    //        pages see webglcontextlost for the ones not worked around yet. Application::recover_compositor_process()
+    //        crashes the browser after three restarts, though, so a page that keeps doing this would need to be
+    //        stopped before then.
+    return !uses_mesa_d3d12();
 #else
     return true;
+#endif
+}
+
+bool OpenGLContext::uses_mesa_d3d12()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->uses_mesa_d3d12.has_value()) {
+        auto const* renderer = reinterpret_cast<char const*>(glGetString(GL_RENDERER));
+        m_impl->uses_mesa_d3d12 = renderer && StringView { renderer, strlen(renderer) }.contains("D3D12"sv);
+    }
+    return *m_impl->uses_mesa_d3d12;
+#else
+    return false;
+#endif
+}
+
+void OpenGLContext::blit_framebuffer(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter)
+{
+#ifdef ENABLE_WEBGL
+    // With Mesa's d3d12 driver on WSL2 (seen with Mesa 26.2 on an Intel GPU), resolving the depth of a multisampled
+    // framebuffer removes the GPU device, unless its depth buffer is DEPTH_COMPONENT16 or DEPTH_COMPONENT32F: nothing
+    // gets drawn from then on, in any WebGL context of the process. three.js does this for every multisampled render
+    // target. Resolving just the color keeps pages working, as few of them read the resolved depth back.
+    if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) && uses_mesa_d3d12() && read_framebuffer_has_unresolvable_depth()) {
+        mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        if (!mask)
+            return;
+    }
+#endif
+    GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+}
+
+// Picks a depth-only format for a format with stencil, or returns the format as it is.
+static GLenum format_without_stencil(GLenum format)
+{
+    switch (format) {
+    case GL_DEPTH24_STENCIL8:
+    case GL_DEPTH_STENCIL_OES:
+        return GL_DEPTH_COMPONENT24;
+    case GL_DEPTH32F_STENCIL8:
+        return GL_DEPTH_COMPONENT32F;
+    case GL_STENCIL_INDEX8:
+        return GL_DEPTH_COMPONENT16;
+    default:
+        return format;
+    }
+}
+
+GLenum OpenGLContext::renderbuffer_format_for(GLenum format)
+{
+#ifdef ENABLE_WEBGL
+    // Pages can give framebuffers of their own a stencil buffer, which runs into the same device loss with Mesa's d3d12
+    // driver as the drawing buffer does, see drawing_buffer_can_have_stencil(). So they get depth only there, too.
+    GLint renderbuffer = 0;
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
+    auto depth_only_format = uses_mesa_d3d12() ? format_without_stencil(format) : format;
+    if (depth_only_format != format)
+        m_impl->renderbuffers_without_stencil.set(renderbuffer, format);
+    else
+        m_impl->renderbuffers_without_stencil.remove(renderbuffer);
+    return depth_only_format;
+#else
+    return format;
+#endif
+}
+
+void OpenGLContext::renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    GLFunctions::renderbuffer_storage(target, renderbuffer_format_for(internalformat), width, height);
+}
+
+void OpenGLContext::renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    GLFunctions::renderbuffer_storage_multisample(target, samples, renderbuffer_format_for(internalformat), width, height);
+}
+
+void OpenGLContext::framebuffer_renderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
+{
+#ifdef ENABLE_WEBGL
+    if (auto original_format = m_impl->renderbuffers_without_stencil.get(renderbuffer); original_format.has_value()) {
+        // The renderbuffer has no stencil, so it can only be the depth attachment, if the page wanted depth from it.
+        bool has_depth = *original_format != GL_STENCIL_INDEX8;
+        if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
+            attachment = has_depth ? GL_DEPTH_ATTACHMENT : GL_STENCIL_ATTACHMENT;
+        if (attachment == GL_STENCIL_ATTACHMENT || (attachment == GL_DEPTH_ATTACHMENT && !has_depth))
+            renderbuffer = 0;
+    }
+#endif
+    GLFunctions::framebuffer_renderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+}
+
+bool OpenGLContext::read_framebuffer_has_unresolvable_depth()
+{
+#ifdef ENABLE_WEBGL
+    GLint read_framebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+    if (read_framebuffer == 0 || static_cast<GLuint>(read_framebuffer) == m_impl->framebuffer)
+        return false;
+
+    for (GLenum attachment : { GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT }) {
+        GLint type = GL_NONE;
+        glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+        if (type != GL_RENDERBUFFER)
+            continue;
+        GLint renderbuffer = 0;
+        glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &renderbuffer);
+
+        GLint original_renderbuffer = 0;
+        glGetIntegerv(GL_RENDERBUFFER_BINDING, &original_renderbuffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+        GLint samples = 0;
+        GLint format = GL_NONE;
+        glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &samples);
+        glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_INTERNAL_FORMAT, &format);
+        glBindRenderbuffer(GL_RENDERBUFFER, original_renderbuffer);
+
+        if (samples > 0 && format != GL_DEPTH_COMPONENT16 && format != GL_DEPTH_COMPONENT32F)
+            return true;
+    }
+    return false;
+#else
+    return false;
 #endif
 }
 
