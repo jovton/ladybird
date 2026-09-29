@@ -69,6 +69,9 @@ public:
     void renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
     void renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
     void framebuffer_renderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
+    void tex_storage2d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height);
+    void tex_image2d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels);
+    void framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
 
     Vector<String> get_supported_opengl_extensions();
 
@@ -88,6 +91,7 @@ private:
     bool uses_mesa_d3d12();
     bool read_framebuffer_has_unresolvable_depth();
     GLenum renderbuffer_format_for(GLenum);
+    void note_texture_stencil(GLenum target, bool has_stencil_dropped);
 #if defined(AK_OS_MACOS)
     void allocate_iosurface_painting_surface();
 #endif

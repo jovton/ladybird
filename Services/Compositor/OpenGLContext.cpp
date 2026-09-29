@@ -77,6 +77,8 @@ struct OpenGLContext::Impl {
 
     // Renderbuffers that the page gave a stencil format, but that got a depth-only one instead, see renderbuffer_storage().
     HashMap<GLuint, GLenum> renderbuffers_without_stencil {};
+    // The same for textures, see tex_storage2d().
+    HashTable<GLuint> textures_without_stencil {};
 };
 
 OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
@@ -771,6 +773,79 @@ void OpenGLContext::framebuffer_renderbuffer(GLenum target, GLenum attachment, G
     }
 #endif
     GLFunctions::framebuffer_renderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+}
+
+static GLenum texture_binding_for(GLenum target)
+{
+    if (target == GL_TEXTURE_2D)
+        return GL_TEXTURE_BINDING_2D;
+    if (target == GL_TEXTURE_CUBE_MAP || (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z))
+        return GL_TEXTURE_BINDING_CUBE_MAP;
+    return GL_NONE;
+}
+
+void OpenGLContext::note_texture_stencil(GLenum target, bool has_stencil_dropped)
+{
+    auto binding = texture_binding_for(target);
+    if (binding == GL_NONE)
+        return;
+    GLint texture = 0;
+    glGetIntegerv(binding, &texture);
+    if (has_stencil_dropped)
+        m_impl->textures_without_stencil.set(texture);
+    else
+        m_impl->textures_without_stencil.remove(texture);
+}
+
+void OpenGLContext::tex_storage2d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
+{
+#ifdef ENABLE_WEBGL
+    // Depth-stencil textures run into the same device loss with Mesa's d3d12 driver as stencil renderbuffers do (clearing
+    // their stencil is enough), see renderbuffer_format_for(). So they get a depth-only format there, too.
+    if (uses_mesa_d3d12() && texture_binding_for(target) != GL_NONE) {
+        auto depth_only_format = internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : internalformat == GL_DEPTH32F_STENCIL8 ? GL_DEPTH_COMPONENT32F
+                                                                                                                                       : internalformat;
+        note_texture_stencil(target, depth_only_format != internalformat);
+        internalformat = depth_only_format;
+    }
+#endif
+    GLFunctions::tex_storage2d(target, levels, internalformat, width, height);
+}
+
+void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    // Like tex_storage2d(), for depth-stencil textures allocated without data, which is how render targets get made.
+    if (uses_mesa_d3d12() && texture_binding_for(target) != GL_NONE && level == 0) {
+        bool drop_stencil = !pixels && format == GL_DEPTH_STENCIL_OES;
+        if (drop_stencil) {
+            if (internalformat == GL_DEPTH32F_STENCIL8) {
+                internalformat = GL_DEPTH_COMPONENT32F;
+                type = GL_FLOAT;
+            } else {
+                internalformat = internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT;
+                type = GL_UNSIGNED_INT;
+            }
+            format = GL_DEPTH_COMPONENT;
+        }
+        note_texture_stencil(target, drop_stencil);
+    }
+#endif
+    GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
+}
+
+void OpenGLContext::framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
+{
+#ifdef ENABLE_WEBGL
+    if (m_impl->textures_without_stencil.contains(texture)) {
+        // The texture has no stencil, so it can only be the depth attachment.
+        if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
+            attachment = GL_DEPTH_ATTACHMENT;
+        else if (attachment == GL_STENCIL_ATTACHMENT)
+            texture = 0;
+    }
+#endif
+    GLFunctions::framebuffer_texture2d(target, attachment, textarget, texture, level);
 }
 
 bool OpenGLContext::read_framebuffer_has_unresolvable_depth()
