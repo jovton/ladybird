@@ -114,7 +114,10 @@ private:
     bool uses_mesa_d3d12();
     bool read_framebuffer_has_unresolvable_depth();
     GLenum renderbuffer_format_for(GLenum);
-    void note_renderbuffer_storage(GLenum requested_format, GLenum format, GLsizei width, GLsizei height);
+    void note_renderbuffer_storage(GLenum requested_format, GLenum format, GLsizei width, GLsizei height, bool within_limits);
+    bool renderbuffer_storage_is_within_limits(GLsizei samples, GLsizei width, GLsizei height);
+    bool texture_image_is(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth);
+    void enable_texture_level_queries();
     bool tex_image_can_succeed(GLenum target, GLsizei width, GLsizei height, GLsizei depth, GLint border);
     void note_texture_stencil(GLenum target, GLint first_level, GLint level_count, bool has_stencil_dropped);
     bool bound_texture_image_has_stencil_dropped(GLenum target, GLint level);

@@ -21,6 +21,7 @@ extern "C" {
 #include <EGL/eglext_angle.h>
 }
 
+#include <AK/Checked.h>
 #include <AK/ByteBuffer.h>
 #include <AK/HashMap.h>
 #include <AK/OwnPtr.h>
@@ -81,6 +82,8 @@ struct OpenGLContext::Impl {
     bool readback_pending { false };
 
     Optional<bool> uses_mesa_d3d12 {};
+    // From ANGLE_get_tex_level_parameter, which the stencil workarounds use on d3d12 to see what a texture image got.
+    PFNGLGETTEXLEVELPARAMETERIVANGLEPROC get_tex_level_parameteriv { nullptr };
 
     // Renderbuffers that the page gave a stencil format, but that got a depth-only one instead, see renderbuffer_storage().
     HashMap<GLuint, GLenum> renderbuffers_without_stencil {};
@@ -879,12 +882,37 @@ bool OpenGLContext::drawing_buffer_can_have_stencil()
 #endif
 }
 
+// OpenGL ES 3.0 can't say what format a texture image got, which the stencil workarounds need to know after
+// texImage2D() and texImage3D(), see texture_image_is(). ANGLE can, once asked to.
+void OpenGLContext::enable_texture_level_queries()
+{
+#ifdef ENABLE_WEBGL
+    auto lists = [](GLenum name) {
+        auto const* extensions = reinterpret_cast<char const*>(glGetString(name));
+        return extensions && StringView { extensions, strlen(extensions) }.split_view(' ').contains_slow("GL_ANGLE_get_tex_level_parameter"sv);
+    };
+    if (!lists(GL_EXTENSIONS)) {
+        if (!lists(GL_REQUESTABLE_EXTENSIONS_ANGLE))
+            return;
+        auto request_extension = reinterpret_cast<PFNGLREQUESTEXTENSIONANGLEPROC>(eglGetProcAddress("glRequestExtensionANGLE"));
+        if (!request_extension)
+            return;
+        request_extension("GL_ANGLE_get_tex_level_parameter");
+        if (!lists(GL_EXTENSIONS))
+            return;
+    }
+    m_impl->get_tex_level_parameteriv = reinterpret_cast<PFNGLGETTEXLEVELPARAMETERIVANGLEPROC>(eglGetProcAddress("glGetTexLevelParameterivANGLE"));
+#endif
+}
+
 bool OpenGLContext::uses_mesa_d3d12()
 {
 #ifdef ENABLE_WEBGL
     if (!m_impl->uses_mesa_d3d12.has_value()) {
         auto const* renderer = reinterpret_cast<char const*>(glGetString(GL_RENDERER));
         m_impl->uses_mesa_d3d12 = renderer && StringView { renderer, strlen(renderer) }.contains("D3D12"sv);
+        if (*m_impl->uses_mesa_d3d12)
+            enable_texture_level_queries();
     }
     return *m_impl->uses_mesa_d3d12;
 #else
@@ -950,7 +978,7 @@ GLenum OpenGLContext::renderbuffer_format_for(GLenum format)
 // Records the format substitution of the bound renderbuffer, once GL has allocated its storage. GL can reject the
 // allocation, keeping the renderbuffer as it was, so this goes by what the renderbuffer actually got. That can't use
 // glGetError(), which would take the error from the page.
-void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum format, GLsizei width, GLsizei height)
+void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum format, GLsizei width, GLsizei height, bool within_limits)
 {
 #ifdef ENABLE_WEBGL
     if (!uses_mesa_d3d12())
@@ -965,10 +993,11 @@ void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum fo
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_INTERNAL_FORMAT, &allocated_format);
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &allocated_width);
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &allocated_height);
-    // A substituted format is always sized, so GL reports it as it is. Otherwise, all that matters is that the stencil
-    // substitution is gone.
+    // The renderbuffer must have exactly the format it was given. Every format a page can give a renderbuffer is sized
+    // (DEPTH_STENCIL always gets substituted), so GL reports it as it is. Failing the same way, but with storage that
+    // already matched, looks the same afterwards, so the allocation must also have been within GL's limits.
     bool substituted = format != requested_format;
-    bool allocated = allocated_width == width && allocated_height == height && (!substituted || static_cast<GLenum>(allocated_format) == format);
+    bool allocated = within_limits && allocated_width == width && allocated_height == height && static_cast<GLenum>(allocated_format) == format;
     if (!allocated)
         return;
     if (substituted)
@@ -986,15 +1015,36 @@ void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum fo
 void OpenGLContext::renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
     auto format = renderbuffer_format_for(internalformat);
+    bool within_limits = renderbuffer_storage_is_within_limits(0, width, height);
     GLFunctions::renderbuffer_storage(target, format, width, height);
-    note_renderbuffer_storage(internalformat, format, width, height);
+    note_renderbuffer_storage(internalformat, format, width, height, within_limits);
 }
 
 void OpenGLContext::renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
 {
     auto format = renderbuffer_format_for(internalformat);
+    bool within_limits = renderbuffer_storage_is_within_limits(samples, width, height);
     GLFunctions::renderbuffer_storage_multisample(target, samples, format, width, height);
-    note_renderbuffer_storage(internalformat, format, width, height);
+    note_renderbuffer_storage(internalformat, format, width, height, within_limits);
+}
+
+bool OpenGLContext::renderbuffer_storage_is_within_limits(GLsizei samples, GLsizei width, GLsizei height)
+{
+#ifdef ENABLE_WEBGL
+    if (!uses_mesa_d3d12())
+        return false;
+    GLint max_size = 0;
+    glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_size);
+    GLint max_samples = 0;
+    if (samples > 0)
+        glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+    return width >= 0 && height >= 0 && width <= max_size && height <= max_size && samples >= 0 && samples <= max_samples;
+#else
+    (void)samples;
+    (void)width;
+    (void)height;
+    return false;
+#endif
 }
 
 void OpenGLContext::delete_renderbuffers(GLsizei n, GLuint const* renderbuffers)
@@ -1102,7 +1152,7 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
 
     DepthOnlyUpload upload;
     if (type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) {
-        if (pixels) {
+        if (pixels && width > 0 && height > 0 && depth > 0) {
             GLint alignment = 4, row_length = 0, skip_pixels = 0, skip_rows = 0, image_height = 0, skip_images = 0;
             glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
             glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
@@ -1112,19 +1162,40 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
                 glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &image_height);
                 glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_images);
             }
-
-            // The page's data is laid out the way GL reads it, see "Unpacking" in the OpenGL ES 3.0 spec.
-            constexpr u64 texel_size = 8;
-            u64 row_stride = static_cast<u64>(row_length > 0 ? row_length : width) * texel_size;
-            row_stride = (row_stride + alignment - 1) / alignment * alignment;
-            u64 image_stride = row_stride * static_cast<u64>(image_height > 0 ? image_height : height);
-            auto offset_of = [&](u64 x, u64 y, u64 z) {
-                return (skip_images + z) * image_stride + (skip_rows + y) * row_stride + (skip_pixels + x) * texel_size;
-            };
-            if (width > 0 && height > 0 && depth > 0 && offset_of(width - 1, height - 1, depth - 1) + texel_size > static_cast<u64>(buf_size))
+            if (alignment < 1 || row_length < 0 || skip_pixels < 0 || skip_rows < 0 || image_height < 0 || skip_images < 0)
                 return {};
 
-            auto repacked = ByteBuffer::create_uninitialized(static_cast<size_t>(width) * height * depth * sizeof(float));
+            // The page's data is laid out the way GL reads it, see "Unpacking" in the OpenGL ES 3.0 spec. All of this is
+            // page-controlled and not validated by GL yet, so every step is checked for overflow, and an overflow leaves
+            // the upload to GL, which rejects it. Once the end of the data is known to fit in buf_size, no offset of a
+            // texel before it can overflow, and the repacked data is at most half its size.
+            constexpr u64 texel_size = 8;
+            Checked<u64> row_stride = static_cast<u64>(row_length > 0 ? row_length : width);
+            row_stride *= texel_size;
+            row_stride += static_cast<u64>(alignment - 1);
+            if (row_stride.has_overflow())
+                return {};
+            u64 aligned_row_stride = row_stride.value() / static_cast<u64>(alignment) * static_cast<u64>(alignment);
+            Checked<u64> image_stride = aligned_row_stride;
+            image_stride *= static_cast<u64>(image_height > 0 ? image_height : height);
+            if (image_stride.has_overflow())
+                return {};
+
+            Checked<u64> end = static_cast<u64>(skip_images) + static_cast<u64>(depth) - 1;
+            end *= image_stride.value();
+            Checked<u64> rows = static_cast<u64>(skip_rows) + static_cast<u64>(height) - 1;
+            rows *= aligned_row_stride;
+            end += rows;
+            Checked<u64> pixels_in_row = static_cast<u64>(skip_pixels) + static_cast<u64>(width);
+            pixels_in_row *= texel_size;
+            end += pixels_in_row;
+            if (end.has_overflow() || end.value() > static_cast<u64>(max(buf_size, 0)))
+                return {};
+
+            auto offset_of = [&](u64 x, u64 y, u64 z) {
+                return (static_cast<u64>(skip_images) + z) * image_stride.value() + (static_cast<u64>(skip_rows) + y) * aligned_row_stride + (static_cast<u64>(skip_pixels) + x) * texel_size;
+            };
+            auto repacked = ByteBuffer::create_uninitialized(static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(depth) * sizeof(float));
             if (repacked.is_error())
                 return {};
             upload.repacked = repacked.release_value();
@@ -1261,13 +1332,18 @@ void OpenGLContext::tex_storage3d(GLenum target, GLsizei levels, GLenum internal
 void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
 {
 #ifdef ENABLE_WEBGL
-    Optional<DepthOnlyUpload> upload;
     if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0 && level <= max_mip_level) {
-        upload = drop_stencil_from_upload(&internalformat, format, type, width, height, 1, buf_size, pixels, false);
-        if (tex_image_can_succeed(target, width, height, 1, border))
+        auto requested_internalformat = internalformat;
+        auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, 1, buf_size, pixels, false);
+        bool can_succeed = tex_image_can_succeed(target, width, height, 1, border);
+        {
+            UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+            GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
+        }
+        if (can_succeed && texture_image_is(target, level, upload.has_value() ? GL_NONE : requested_internalformat, width, height, 1))
             note_texture_stencil(target, level, 1, upload.has_value());
+        return;
     }
-    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
 }
@@ -1275,15 +1351,74 @@ void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint i
 void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
 {
 #ifdef ENABLE_WEBGL
-    Optional<DepthOnlyUpload> upload;
     if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0 && level <= max_mip_level) {
-        upload = drop_stencil_from_upload(&internalformat, format, type, width, height, depth, buf_size, pixels, true);
-        if (tex_image_can_succeed(target, width, height, depth, border))
+        auto requested_internalformat = internalformat;
+        auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, depth, buf_size, pixels, true);
+        bool can_succeed = tex_image_can_succeed(target, width, height, depth, border);
+        {
+            UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+            GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
+        }
+        if (can_succeed && texture_image_is(target, level, upload.has_value() ? GL_NONE : requested_internalformat, width, height, depth))
             note_texture_stencil(target, level, 1, upload.has_value());
+        return;
     }
-    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
+}
+
+// Whether the texture image at target and level now is what texImage2D()/texImage3D() asked for, i.e. whether GL accepted
+// the call. For a depth-stencil request that got a depth-only format (internalformat GL_NONE), that means some depth-only
+// format; for a sized format, exactly that one. Unsized formats (like GL_RGBA) are reported sized, so only their size is
+// compared. Without ANGLE_get_tex_level_parameter, this can't be told, and tex_image_can_succeed() has to do.
+// The texture level parameters ANGLE_get_tex_level_parameter answers, from OpenGL ES 3.1.
+static constexpr GLenum texture_width_parameter = 0x1000;          // GL_TEXTURE_WIDTH
+static constexpr GLenum texture_height_parameter = 0x1001;         // GL_TEXTURE_HEIGHT
+static constexpr GLenum texture_internal_format_parameter = 0x1003; // GL_TEXTURE_INTERNAL_FORMAT
+static constexpr GLenum texture_depth_parameter = 0x8071;          // GL_TEXTURE_DEPTH
+
+static bool is_unsized_format(GLint format)
+{
+    switch (format) {
+    case GL_RGB:
+    case GL_RGBA:
+    case GL_LUMINANCE:
+    case GL_LUMINANCE_ALPHA:
+    case GL_ALPHA:
+    case GL_DEPTH_COMPONENT:
+    case GL_DEPTH_STENCIL_OES:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool OpenGLContext::texture_image_is(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth)
+{
+#ifdef ENABLE_WEBGL
+    auto get = m_impl->get_tex_level_parameteriv;
+    if (!get)
+        return true;
+    GLint actual_format = GL_NONE, actual_width = 0, actual_height = 0, actual_depth = 1;
+    get(target, level, texture_internal_format_parameter, &actual_format);
+    get(target, level, texture_width_parameter, &actual_width);
+    get(target, level, texture_height_parameter, &actual_height);
+    if (target == GL_TEXTURE_2D_ARRAY)
+        get(target, level, texture_depth_parameter, &actual_depth);
+    if (actual_width != width || actual_height != height || actual_depth != depth)
+        return false;
+    if (internalformat == GL_NONE)
+        return actual_format == GL_DEPTH_COMPONENT16 || actual_format == GL_DEPTH_COMPONENT24 || actual_format == GL_DEPTH_COMPONENT32F;
+    return is_unsized_format(internalformat) || actual_format == internalformat;
+#else
+    (void)target;
+    (void)level;
+    (void)internalformat;
+    (void)width;
+    (void)height;
+    (void)depth;
+    return false;
+#endif
 }
 
 // texImage2D()/texImage3D() leave the texture as it was when GL rejects them, so their substitution must only be recorded
