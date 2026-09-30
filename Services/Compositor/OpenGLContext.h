@@ -79,6 +79,10 @@ public:
 
     Vector<String> get_supported_opengl_extensions();
 
+    // Whether the drawing buffer has the stencil buffer the page asked for, which it doesn't on every driver, see
+    // drawing_buffer_can_have_stencil(). Pages see this in getContextAttributes().
+    bool drawing_buffer_has_stencil();
+
 private:
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
     Gfx::IntSize m_size;

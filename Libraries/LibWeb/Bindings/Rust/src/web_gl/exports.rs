@@ -120,6 +120,8 @@ pub struct ContextCreationArguments {
     canvas_host: *mut c_void,
     canvas_is_offscreen: bool,
     context_attributes: ContextAttributes,
+    /// What the drawing buffer really got, which can differ from what the page asked for.
+    actual_context_attributes: ContextAttributes,
     supported_extensions: *const ByteSpan,
     supported_extension_count: usize,
 }
@@ -173,6 +175,7 @@ pub unsafe extern "C" fn web_webgl_context_create(
         realm,
         canvas,
         context_attributes: arguments.context_attributes.into(),
+        actual_context_attributes: arguments.actual_context_attributes.into(),
         // SAFETY: The caller passes live names.
         supported_opengl_extensions: unsafe {
             extension_names(arguments.supported_extensions, arguments.supported_extension_count)
@@ -285,27 +288,30 @@ pub unsafe extern "C" fn web_webgl_context_wants_restoring(context: *mut c_void)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_webgl_context_actual_context_parameters(
+pub unsafe extern "C" fn web_webgl_context_context_creation_parameters(
     context: *mut c_void,
     out_context_attributes: *mut ContextAttributes,
 ) {
-    let context_attributes = unsafe { with_context(context, |context| context.actual_context_parameters) };
+    let context_attributes = unsafe { with_context(context, |context| context.context_creation_parameters) };
     unsafe { out_context_attributes.write(context_attributes.into()) };
 }
 
-/// The context takes over the reference to `transport`.
+/// The context takes over the reference to `transport`. The actual context attributes are what its new drawing buffer
+/// really got.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_webgl_context_restore(
     context: *mut c_void,
     transport: *mut c_void,
+    actual_context_attributes: *const ContextAttributes,
     supported_extensions: *const ByteSpan,
     supported_extension_count: usize,
 ) {
     let transport = NonNull::new(transport).expect("C++ passes the transport");
     unsafe {
+        let actual_context_attributes = (*actual_context_attributes).into();
         let supported_opengl_extensions = extension_names(supported_extensions, supported_extension_count);
         with_context(context, |context| {
-            context.restore(CppTransport::from_raw(transport), supported_opengl_extensions);
+            context.restore(CppTransport::from_raw(transport), actual_context_attributes, supported_opengl_extensions);
         });
     }
 }

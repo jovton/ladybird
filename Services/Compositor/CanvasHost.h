@@ -45,6 +45,8 @@ public:
         bool success { false };
         Compositing::CanvasId canvas_id { 0 };
         Vector<String> supported_extensions;
+        // What the drawing buffer really got, which can differ from what the page asked for.
+        bool stencil { false };
     };
 
     CanvasHost(RefPtr<Gfx::SkiaBackendContext>, Compositing::CanvasSurfaceRegistry&);

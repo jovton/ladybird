@@ -75,6 +75,8 @@ struct ContextCreationArguments {
     void* canvas_host { nullptr };
     bool canvas_is_offscreen { false };
     RustContextAttributes context_attributes;
+    // What the drawing buffer really got, which can differ from what the page asked for.
+    RustContextAttributes actual_context_attributes;
     ByteSpan const* supported_extensions { nullptr };
     size_t supported_extension_count { 0 };
 };
@@ -124,8 +126,8 @@ void* web_webgl_context_read_back_drawing_buffer(void* context, i32 x, i32 y, i3
 bool web_webgl_context_mark_lost(void* context);
 void web_webgl_context_set_restore_requested(void* context, bool requested);
 bool web_webgl_context_wants_restoring(void* context);
-void web_webgl_context_actual_context_parameters(void* context, RustContextAttributes* out_context_attributes);
-void web_webgl_context_restore(void* context, void* transport, ByteSpan const* supported_extensions, size_t supported_extension_count);
+void web_webgl_context_context_creation_parameters(void* context, RustContextAttributes* out_context_attributes);
+void web_webgl_context_restore(void* context, void* transport, RustContextAttributes const* actual_context_attributes, ByteSpan const* supported_extensions, size_t supported_extension_count);
 bool web_webgl_context_xr_compatible(void* context);
 void web_webgl_context_set_xr_compatible(void* context, bool xr_compatible);
 
@@ -215,6 +217,16 @@ namespace {
 struct RemoteWebGLContext {
     NonnullRefPtr<RemoteWebGLTransport> transport;
     Vector<String> supported_extensions;
+    bool stencil { false };
+
+    // The actual context parameters are the requested ones, except for what the drawing buffer could not get: with
+    // Mesa's d3d12 driver, it has no stencil buffer, see OpenGLContext::drawing_buffer_can_have_stencil().
+    RustContextAttributes actual_context_attributes(RustContextAttributes const& requested) const
+    {
+        auto actual = requested;
+        actual.stencil = stencil;
+        return actual;
+    }
 
     Vector<ByteSpan> supported_extension_spans() const
     {
@@ -243,7 +255,7 @@ Optional<RemoteWebGLContext> create_remote_webgl_context(HTML::CanvasHost& canva
     //     canvas id. Content updates alone don't invalidate the display list, so do it here.
     canvas.did_create_canvas_backing_storage();
 
-    return RemoteWebGLContext { transport.release_nonnull(), move(result.supported_extensions) };
+    return RemoteWebGLContext { transport.release_nonnull(), move(result.supported_extensions), result.stencil };
 }
 
 }
@@ -261,6 +273,7 @@ JS::ThrowCompletionOr<WebGLRenderingContextBase*> WebGLRenderingContextBase::cre
     }
 
     auto supported_extensions = remote->supported_extension_spans();
+    auto requested_context_attributes = to_rust_context_attributes(context_attributes);
     ContextCreationArguments arguments {
         .transport = &remote->transport.leak_ref(),
         .is_webgl2 = webgl_version == WebGLVersion::WebGL2,
@@ -268,7 +281,8 @@ JS::ThrowCompletionOr<WebGLRenderingContextBase*> WebGLRenderingContextBase::cre
         .canvas = canvas.visit([](auto const& canvas) -> void* { return static_cast<GC::Cell*>(canvas.ptr()); }),
         .canvas_host = &canvas_host,
         .canvas_is_offscreen = canvas.has<GC::Ref<HTML::OffscreenCanvas>>(),
-        .context_attributes = to_rust_context_attributes(context_attributes),
+        .context_attributes = requested_context_attributes,
+        .actual_context_attributes = remote->actual_context_attributes(requested_context_attributes),
         .supported_extensions = supported_extensions.data(),
         .supported_extension_count = supported_extensions.size(),
     };
@@ -345,15 +359,17 @@ void WebGLRenderingContextBase::restore_context_after_compositor_reconnect()
 
     // A fresh host context starts with no GL objects; per the spec the page re-creates them
     // in its webglcontextrestored handler.
-    RustContextAttributes actual_context_parameters;
-    web_webgl_context_actual_context_parameters(this, &actual_context_parameters);
+    // NB: The drawing buffer is created anew from what the page asked for, not from what the lost one got.
+    RustContextAttributes context_creation_parameters;
+    web_webgl_context_context_creation_parameters(this, &context_creation_parameters);
     auto webgl_version = web_webgl_context_is_webgl2(this) ? WebGLVersion::WebGL2 : WebGLVersion::WebGL1;
-    auto remote = create_remote_webgl_context(canvas_host(), webgl_version, actual_context_parameters.depth, actual_context_parameters.stencil, actual_context_parameters.antialias);
+    auto remote = create_remote_webgl_context(canvas_host(), webgl_version, context_creation_parameters.depth, context_creation_parameters.stencil, context_creation_parameters.antialias);
     if (!remote.has_value())
         return;
 
     auto supported_extensions = remote->supported_extension_spans();
-    web_webgl_context_restore(this, &remote->transport.leak_ref(), supported_extensions.data(), supported_extensions.size());
+    auto actual_context_attributes = remote->actual_context_attributes(context_creation_parameters);
+    web_webgl_context_restore(this, &remote->transport.leak_ref(), &actual_context_attributes, supported_extensions.data(), supported_extensions.size());
 
     HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this] {
         fire_webgl_context_event(canvas_host(), EventNames::webglcontextrestored);

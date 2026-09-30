@@ -114,8 +114,9 @@ CanvasHost::CreateWebGLContextResult CanvasHost::create_webgl_context(Compositin
 
     auto canvas_id = m_canvas_surface_registry.allocate_canvas_id();
     auto supported_extensions = context->gl_context().get_supported_opengl_extensions();
+    auto has_stencil = context->gl_context().drawing_buffer_has_stencil();
     m_contexts.set(canvas_id, context.release_nonnull());
-    return { .success = true, .canvas_id = canvas_id, .supported_extensions = move(supported_extensions) };
+    return { .success = true, .canvas_id = canvas_id, .supported_extensions = move(supported_extensions), .stencil = has_stencil };
 }
 
 void CanvasHost::destroy_context(Compositing::CanvasId canvas_id)
