@@ -34,13 +34,14 @@ JS::ThrowCompletionOr<GC::Ptr<WebGL2RenderingContext>> WebGL2RenderingContext::c
     // We should be coming here from getContext being called on a wrapped <canvas> element or OffscreenCanvas.
     auto context_attributes = TRY(convert_value_to_context_attributes_dictionary(realm.vm(), options));
 
-    auto context = create_webgl_context_proxy(canvas_host_for(canvas), WebGLVersion::WebGL2, context_attributes);
+    WebGLContextAttributes actual_context_attributes;
+    auto context = create_webgl_context_proxy(canvas_host_for(canvas), WebGLVersion::WebGL2, context_attributes, actual_context_attributes);
     if (!context) {
         fire_webgl_context_creation_error(canvas_host_for(canvas));
         return GC::Ptr<WebGL2RenderingContext> { nullptr };
     }
 
-    return realm.create<WebGL2RenderingContext>(realm, canvas, context.release_nonnull(), context_attributes, context_attributes);
+    return realm.create<WebGL2RenderingContext>(realm, canvas, context.release_nonnull(), context_attributes, actual_context_attributes);
 }
 
 WebGL2RenderingContext::WebGL2RenderingContext(JS::Realm& realm, CanvasOwner canvas, NonnullOwnPtr<WebGLContextProxy> context, WebGLContextAttributes context_creation_parameters, WebGLContextAttributes actual_context_parameters)
@@ -67,7 +68,7 @@ void WebGL2RenderingContext::prepare_for_compositing()
 
 bool WebGL2RenderingContext::reestablish_remote_context()
 {
-    return restore_webgl_context_proxy(context(), canvas_host(), WebGLVersion::WebGL2, m_actual_context_parameters);
+    return restore_webgl_context_proxy(context(), canvas_host(), WebGLVersion::WebGL2, m_context_creation_parameters, m_actual_context_parameters);
 }
 
 CanvasOwner WebGL2RenderingContext::canvas_for_binding() const
