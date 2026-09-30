@@ -426,7 +426,7 @@ void CompositorConnection::present_frame(Web::CompositorContextId context_id, Gf
     async_present_frame(context_id, viewport_rect);
 }
 
-Optional<Compositing::CanvasId> CompositorConnection::create_webgl_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias, bool& out_has_stencil, Vector<String>& out_supported_extensions)
+Optional<Compositing::CanvasId> CompositorConnection::create_webgl_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias, bool& out_has_stencil, bool& out_has_antialias, Vector<String>& out_supported_extensions)
 {
     if (!can_send_message_to_compositor())
         return {};
@@ -434,6 +434,7 @@ Optional<Compositing::CanvasId> CompositorConnection::create_webgl_context(Compo
     auto response = send_sync<Messages::CompositorWebContentServer::CreateWebglContext>(webgl_version, size, depth, stencil, antialias);
     out_supported_extensions = response->take_supported_extensions();
     out_has_stencil = response->has_stencil();
+    out_has_antialias = response->has_antialias();
     if (!response->success())
         return {};
     return response->canvas_id();
