@@ -70,8 +70,12 @@ public:
     void renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
     void framebuffer_renderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
     void tex_storage2d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height);
+    void tex_storage3d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth);
     void tex_image2d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels);
+    void tex_image3d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels);
     void framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+    void framebuffer_texture_layer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);
+    void delete_textures(GLsizei n, GLuint const* textures);
 
     Vector<String> get_supported_opengl_extensions();
 
@@ -91,7 +95,8 @@ private:
     bool uses_mesa_d3d12();
     bool read_framebuffer_has_unresolvable_depth();
     GLenum renderbuffer_format_for(GLenum);
-    void note_texture_stencil(GLenum target, bool has_stencil_dropped);
+    void note_texture_stencil(GLenum target, GLint first_level, GLint level_count, bool has_stencil_dropped);
+    void attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level);
 #if defined(AK_OS_MACOS)
     void allocate_iosurface_painting_surface();
 #endif

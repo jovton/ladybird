@@ -77,8 +77,9 @@ struct OpenGLContext::Impl {
 
     // Renderbuffers that the page gave a stencil format, but that got a depth-only one instead, see renderbuffer_storage().
     HashMap<GLuint, GLenum> renderbuffers_without_stencil {};
-    // The same for textures, see tex_storage2d().
-    HashTable<GLuint> textures_without_stencil {};
+    // The same for texture images, see tex_storage2d(). A key names one attachable image: the texture, which of its
+    // images (see texture_image_kind()) and the mip level, see texture_image_key().
+    HashTable<u64> texture_images_without_stencil {};
 };
 
 OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
@@ -775,77 +776,181 @@ void OpenGLContext::framebuffer_renderbuffer(GLenum target, GLenum attachment, G
     GLFunctions::framebuffer_renderbuffer(target, attachment, renderbuffertarget, renderbuffer);
 }
 
+// Depth-stencil textures run into the same device loss with Mesa's d3d12 driver as stencil renderbuffers do (clearing
+// their stencil is enough), see renderbuffer_format_for(). So on d3d12 every depth-stencil texture image gets a
+// depth-only format, whichever call allocates it (tex_storage2d(), tex_storage3d(), tex_image2d_robust_angle(),
+// tex_image3d_robust_angle()) and whatever its mip level, and is only ever attached as depth. WebGL can attach any mip
+// level of a 2D texture or cube map face, and any layer of a 2D array texture (depth formats can't be 3D textures), so
+// what got substituted is tracked per attachable image: the texture, the kind of image and the mip level. The layers of
+// a 2D array texture share their level's format.
+
+// Which image of a texture a target names: 0 for a 2D texture, 1 to 6 for the faces of a cube map, 7 for a 2D array
+// texture. Other targets can't hold depth.
+static Optional<u8> texture_image_kind(GLenum target)
+{
+    if (target == GL_TEXTURE_2D)
+        return 0;
+    if (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
+        return static_cast<u8>(1 + target - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
+    if (target == GL_TEXTURE_2D_ARRAY)
+        return 7;
+    return {};
+}
+
+static u64 texture_image_key(GLuint texture, u8 kind, GLint level)
+{
+    return (static_cast<u64>(texture) << 32) | (static_cast<u64>(kind) << 16) | static_cast<u16>(level);
+}
+
 static GLenum texture_binding_for(GLenum target)
 {
     if (target == GL_TEXTURE_2D)
         return GL_TEXTURE_BINDING_2D;
     if (target == GL_TEXTURE_CUBE_MAP || (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z))
         return GL_TEXTURE_BINDING_CUBE_MAP;
+    if (target == GL_TEXTURE_2D_ARRAY)
+        return GL_TEXTURE_BINDING_2D_ARRAY;
     return GL_NONE;
 }
 
-void OpenGLContext::note_texture_stencil(GLenum target, bool has_stencil_dropped)
+static GLenum depth_only_format_for(GLenum internalformat)
+{
+    if (internalformat == GL_DEPTH24_STENCIL8)
+        return GL_DEPTH_COMPONENT24;
+    if (internalformat == GL_DEPTH32F_STENCIL8)
+        return GL_DEPTH_COMPONENT32F;
+    return internalformat;
+}
+
+// For texImage2D()/texImage3D() without data, which is how render targets get made: turns a depth-stencil upload into a
+// depth-only one. Uploads with data keep their stencil, as the data would have to be converted.
+static bool drop_stencil_from_upload(GLint& internalformat, GLenum& format, GLenum& type, void const* pixels)
+{
+    if (pixels || format != GL_DEPTH_STENCIL_OES)
+        return false;
+    if (internalformat == GL_DEPTH32F_STENCIL8) {
+        internalformat = GL_DEPTH_COMPONENT32F;
+        type = GL_FLOAT;
+    } else {
+        internalformat = internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT;
+        type = GL_UNSIGNED_INT;
+    }
+    format = GL_DEPTH_COMPONENT;
+    return true;
+}
+
+void OpenGLContext::note_texture_stencil(GLenum target, GLint first_level, GLint level_count, bool has_stencil_dropped)
 {
     auto binding = texture_binding_for(target);
     if (binding == GL_NONE)
         return;
     GLint texture = 0;
     glGetIntegerv(binding, &texture);
-    if (has_stencil_dropped)
-        m_impl->textures_without_stencil.set(texture);
-    else
-        m_impl->textures_without_stencil.remove(texture);
+
+    // Allocating a whole cube map (texStorage2D) covers all of its faces.
+    Vector<u8, 6> kinds;
+    if (target == GL_TEXTURE_CUBE_MAP) {
+        for (u8 face = 1; face <= 6; ++face)
+            kinds.append(face);
+    } else if (auto kind = texture_image_kind(target); kind.has_value()) {
+        kinds.append(*kind);
+    }
+
+    for (auto kind : kinds) {
+        for (GLint level = first_level; level < first_level + level_count; ++level) {
+            auto key = texture_image_key(static_cast<GLuint>(texture), kind, level);
+            if (has_stencil_dropped)
+                m_impl->texture_images_without_stencil.set(key);
+            else
+                m_impl->texture_images_without_stencil.remove(key);
+        }
+    }
 }
 
 void OpenGLContext::tex_storage2d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
 {
 #ifdef ENABLE_WEBGL
-    // Depth-stencil textures run into the same device loss with Mesa's d3d12 driver as stencil renderbuffers do (clearing
-    // their stencil is enough), see renderbuffer_format_for(). So they get a depth-only format there, too.
     if (uses_mesa_d3d12() && texture_binding_for(target) != GL_NONE) {
-        auto depth_only_format = internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : internalformat == GL_DEPTH32F_STENCIL8 ? GL_DEPTH_COMPONENT32F
-                                                                                                                                       : internalformat;
-        note_texture_stencil(target, depth_only_format != internalformat);
+        auto depth_only_format = depth_only_format_for(internalformat);
+        note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
         internalformat = depth_only_format;
     }
 #endif
     GLFunctions::tex_storage2d(target, levels, internalformat, width, height);
 }
 
+void OpenGLContext::tex_storage3d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
+{
+#ifdef ENABLE_WEBGL
+    if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY) {
+        auto depth_only_format = depth_only_format_for(internalformat);
+        note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
+        internalformat = depth_only_format;
+    }
+#endif
+    GLFunctions::tex_storage3d(target, levels, internalformat, width, height, depth);
+}
+
 void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
 {
 #ifdef ENABLE_WEBGL
-    // Like tex_storage2d(), for depth-stencil textures allocated without data, which is how render targets get made.
-    if (uses_mesa_d3d12() && texture_binding_for(target) != GL_NONE && level == 0) {
-        bool drop_stencil = !pixels && format == GL_DEPTH_STENCIL_OES;
-        if (drop_stencil) {
-            if (internalformat == GL_DEPTH32F_STENCIL8) {
-                internalformat = GL_DEPTH_COMPONENT32F;
-                type = GL_FLOAT;
-            } else {
-                internalformat = internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT;
-                type = GL_UNSIGNED_INT;
-            }
-            format = GL_DEPTH_COMPONENT;
-        }
-        note_texture_stencil(target, drop_stencil);
-    }
+    if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0)
+        note_texture_stencil(target, level, 1, drop_stencil_from_upload(internalformat, format, type, pixels));
 #endif
     GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
+}
+
+void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0)
+        note_texture_stencil(target, level, 1, drop_stencil_from_upload(internalformat, format, type, pixels));
+#endif
+    GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
+}
+
+// A texture image that has no stencil can only be the depth attachment.
+void OpenGLContext::attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level)
+{
+    if (!m_impl->texture_images_without_stencil.contains(texture_image_key(texture, kind, level)))
+        return;
+    if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
+        attachment = GL_DEPTH_ATTACHMENT;
+    else if (attachment == GL_STENCIL_ATTACHMENT)
+        texture = 0;
 }
 
 void OpenGLContext::framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
 {
 #ifdef ENABLE_WEBGL
-    if (m_impl->textures_without_stencil.contains(texture)) {
-        // The texture has no stencil, so it can only be the depth attachment.
-        if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
-            attachment = GL_DEPTH_ATTACHMENT;
-        else if (attachment == GL_STENCIL_ATTACHMENT)
-            texture = 0;
-    }
+    if (auto kind = texture_image_kind(textarget); kind.has_value() && texture != 0)
+        attach_texture_image_without_stencil(attachment, texture, *kind, level);
 #endif
     GLFunctions::framebuffer_texture2d(target, attachment, textarget, texture, level);
+}
+
+void OpenGLContext::framebuffer_texture_layer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer)
+{
+#ifdef ENABLE_WEBGL
+    // Of the textures with layers, only 2D arrays can hold depth.
+    if (texture != 0)
+        attach_texture_image_without_stencil(attachment, texture, *texture_image_kind(GL_TEXTURE_2D_ARRAY), level);
+#endif
+    GLFunctions::framebuffer_texture_layer(target, attachment, texture, level, layer);
+}
+
+void OpenGLContext::delete_textures(GLsizei n, GLuint const* textures)
+{
+#ifdef ENABLE_WEBGL
+    // GL may give a deleted texture's name to a new texture, which must not inherit the old one's substitutions.
+    if (!m_impl->texture_images_without_stencil.is_empty()) {
+        for (GLsizei i = 0; i < n; ++i) {
+            auto texture = static_cast<u64>(textures[i]);
+            m_impl->texture_images_without_stencil.remove_all_matching([&](u64 key) { return (key >> 32) == texture; });
+        }
+    }
+#endif
+    GLFunctions::delete_textures(n, textures);
 }
 
 bool OpenGLContext::read_framebuffer_has_unresolvable_depth()
