@@ -47,6 +47,7 @@ public:
         Vector<String> supported_extensions;
         // What the drawing buffer really got, which can differ from what the page asked for.
         bool stencil { false };
+        bool antialias { false };
     };
 
     CanvasHost(RefPtr<Gfx::SkiaBackendContext>, Compositing::CanvasSurfaceRegistry&);

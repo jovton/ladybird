@@ -76,12 +76,19 @@ public:
     void framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
     void framebuffer_texture_layer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);
     void delete_textures(GLsizei n, GLuint const* textures);
+    // With antialiasing, these read the page's drawing buffer from the resolved framebuffer, see begin_reading_drawing_buffer().
+    void read_pixels_robust_angle(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, GLsizei* length, GLsizei* columns, GLsizei* rows, void* pixels);
+    void copy_tex_image2d(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border);
+    void copy_tex_sub_image2d(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);
 
     Vector<String> get_supported_opengl_extensions();
 
     // Whether the drawing buffer has the stencil buffer the page asked for, which it doesn't on every driver, see
     // drawing_buffer_can_have_stencil(). Pages see this in getContextAttributes().
     bool drawing_buffer_has_stencil();
+    // Whether the drawing buffer is antialiased, as the page asked for, which only WebGL 2 contexts get, see
+    // drawing_buffer_can_have_antialias(). Pages see this in getContextAttributes().
+    bool drawing_buffer_has_antialias();
 
 private:
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
@@ -96,6 +103,11 @@ private:
 
     void free_surface_resources();
     bool drawing_buffer_can_have_stencil();
+    bool drawing_buffer_can_have_antialias();
+    bool allocate_msaa_drawing_buffer(bool stencil);
+    void resolve_drawing_buffer();
+    bool begin_reading_drawing_buffer();
+    void end_reading_drawing_buffer(bool redirected);
     bool uses_mesa_d3d12();
     bool read_framebuffer_has_unresolvable_depth();
     GLenum renderbuffer_format_for(GLenum);

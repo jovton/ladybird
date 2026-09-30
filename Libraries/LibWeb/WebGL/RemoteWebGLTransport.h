@@ -31,6 +31,8 @@ public:
         Vector<String> supported_extensions;
         // Whether the drawing buffer really has a stencil buffer. It can lack one the page asked for.
         bool stencil { false };
+        // Whether the drawing buffer is really antialiased, which only WebGL 2 contexts can be.
+        bool antialias { false };
     };
     virtual CreateResult create_context(WebGLVersion, Gfx::IntSize initial_size, bool depth, bool stencil, bool antialias) = 0;
     virtual Optional<Compositing::CanvasId> canvas_id() const = 0;

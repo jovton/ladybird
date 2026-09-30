@@ -139,7 +139,8 @@ pub(crate) struct ContextState {
     pub(crate) context_creation_parameters: WebGLContextAttributes,
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#actual-context-parameters
     /// What the drawing buffer really got, set each time it is created. It can lack a stencil buffer that the page
-    /// asked for, see OpenGLContext::drawing_buffer_can_have_stencil() in the Compositor.
+    /// asked for, see OpenGLContext::drawing_buffer_can_have_stencil() in the Compositor, and only WebGL 2 drawing
+    /// buffers are antialiased.
     #[gc(untraced)]
     actual_context_parameters: Cell<WebGLContextAttributes>,
     #[gc(untraced)]

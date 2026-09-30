@@ -218,13 +218,16 @@ struct RemoteWebGLContext {
     NonnullRefPtr<RemoteWebGLTransport> transport;
     Vector<String> supported_extensions;
     bool stencil { false };
+    bool antialias { false };
 
     // The actual context parameters are the requested ones, except for what the drawing buffer could not get: with
-    // Mesa's d3d12 driver, it has no stencil buffer, see OpenGLContext::drawing_buffer_can_have_stencil().
+    // Mesa's d3d12 driver, it has no stencil buffer, see OpenGLContext::drawing_buffer_can_have_stencil(), and only
+    // WebGL 2 contexts are antialiased, see OpenGLContext::drawing_buffer_can_have_antialias().
     RustContextAttributes actual_context_attributes(RustContextAttributes const& requested) const
     {
         auto actual = requested;
         actual.stencil = stencil;
+        actual.antialias = antialias;
         return actual;
     }
 
@@ -255,7 +258,7 @@ Optional<RemoteWebGLContext> create_remote_webgl_context(HTML::CanvasHost& canva
     //     canvas id. Content updates alone don't invalidate the display list, so do it here.
     canvas.did_create_canvas_backing_storage();
 
-    return RemoteWebGLContext { transport.release_nonnull(), move(result.supported_extensions), result.stencil };
+    return RemoteWebGLContext { transport.release_nonnull(), move(result.supported_extensions), result.stencil, result.antialias };
 }
 
 }
