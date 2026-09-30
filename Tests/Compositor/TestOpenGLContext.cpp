@@ -9,6 +9,9 @@
 #include <GLES3/gl3.h>
 
 #include <Compositor/OpenGLContext.h>
+#include <AK/String.h>
+#include <AK/StringBuilder.h>
+#include <AK/Time.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibGfx/SkiaBackendContext.h>
@@ -207,3 +210,166 @@ TEST_CASE(depth_stencil_texture_images_are_attached_without_stencil_on_d3d12)
     glDeleteFramebuffers(1, &framebuffer);
 }
 
+
+// A page can ask texStorage2D() for any number of mip levels. GL rejects impossible counts, and the Compositor must not
+// spend time on them either before it does: with Mesa's d3d12 driver, it tracks each level, see
+// OpenGLContext::tex_storage2d().
+TEST_CASE(impossible_mip_level_counts_are_rejected_quickly)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    GLuint textures[2] {};
+    glGenTextures(2, textures);
+    auto start = MonotonicTime::now();
+    glBindTexture(GL_TEXTURE_2D, textures[0]);
+    context->tex_storage2d(GL_TEXTURE_2D, 0x7fffffff, GL_DEPTH24_STENCIL8, 8, 8);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    glBindTexture(GL_TEXTURE_CUBE_MAP, textures[1]);
+    context->tex_storage2d(GL_TEXTURE_CUBE_MAP, 0x7fffffff, GL_RGBA8, 8, 8);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0x7fffffff, GL_DEPTH24_STENCIL8, 1, 1, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT((MonotonicTime::now() - start) < AK::Duration::from_seconds(1));
+    context->delete_textures(2, textures);
+}
+
+// Draws a quad at depth 0.5 into a framebuffer with the given depth texture, and returns which of its 8 columns got
+// drawn: those whose stored depth is greater than 0.5.
+static String columns_in_front_of_stored_depth(Compositor::OpenGLContext& context, GLuint depth_texture)
+{
+    GLuint framebuffer = 0;
+    GLuint color = 0;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glGenRenderbuffers(1, &color);
+    glBindRenderbuffer(GL_RENDERBUFFER, color);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 8, 8);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, color);
+    context.framebuffer_texture2d(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, depth_texture, 0);
+
+    // With Mesa's d3d12 driver, the texture must have lost its stencil, which is what keeps the device alive.
+    auto const* renderer = reinterpret_cast<char const*>(glGetString(GL_RENDERER));
+    if (renderer && StringView { renderer, strlen(renderer) }.contains("D3D12"sv)) {
+        GLint stencil_type = GL_NONE;
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &stencil_type);
+        EXPECT_EQ(stencil_type, GL_NONE);
+    }
+
+    auto compile = [](GLenum type, char const* source) {
+        auto shader = glCreateShader(type);
+        glShaderSource(shader, 1, &source, nullptr);
+        glCompileShader(shader);
+        return shader;
+    };
+    auto program = glCreateProgram();
+    glAttachShader(program, compile(GL_VERTEX_SHADER, "attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }"));
+    glAttachShader(program, compile(GL_FRAGMENT_SHADER, "precision mediump float; void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }"));
+    glBindAttribLocation(program, 0, "p");
+    glLinkProgram(program);
+    glUseProgram(program);
+    GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+    GLuint buffer = 0;
+    glGenBuffers(1, &buffer);
+    glBindBuffer(GL_ARRAY_BUFFER, buffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_FALSE);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_DEPTH_TEST);
+
+    u8 pixels[8 * 4] {};
+    glReadPixels(0, 4, 8, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    StringBuilder columns;
+    for (int x = 0; x < 8; ++x)
+        columns.append(pixels[x * 4] ? 'x' : '.');
+
+    glDeleteBuffers(1, &buffer);
+    glDeleteProgram(program);
+    glDeleteRenderbuffers(1, &color);
+    glDeleteFramebuffers(1, &framebuffer);
+    return MUST(columns.to_string());
+}
+
+// Depth-stencil data a page uploads must keep its depth when the texture gets a depth-only format on d3d12, see
+// drop_stencil_from_upload(). The left half of each texture is at depth 0.25, the right half at 0.75, so a quad at 0.5
+// shows up in the right half only.
+TEST_CASE(depth_stencil_data_keeps_its_depth)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    auto depth24_at = [](int x) { return static_cast<u32>((x < 4 ? 0.25 : 0.75) * 0xffffff) << 8 | 0x5a; };
+    auto depth32f_at = [](int x) { return x < 4 ? 0.25f : 0.75f; };
+
+    GLuint textures[3] {};
+    glGenTextures(3, textures);
+
+    // UNSIGNED_INT_24_8, with texImage2D().
+    Vector<u32> texels24;
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x)
+            texels24.append(depth24_at(x));
+    }
+    glBindTexture(GL_TEXTURE_2D, textures[0]);
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, texels24.size() * 4, texels24.data());
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(columns_in_front_of_stored_depth(*context, textures[0]), "....xxxx"sv);
+
+    // FLOAT_32_UNSIGNED_INT_24_8_REV, laid out with a longer row length and skipped pixels and rows, which the depths get
+    // repacked from.
+    constexpr int row_length = 11, skip_pixels = 2, skip_rows = 1;
+    Vector<u32> texels32f;
+    texels32f.resize((skip_rows + 8) * row_length * 2);
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            auto index = ((skip_rows + y) * row_length + skip_pixels + x) * 2;
+            float depth = depth32f_at(x);
+            memcpy(&texels32f[index], &depth, sizeof(float));
+            texels32f[index + 1] = 0x5a;
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, textures[1]);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH32F_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, texels32f.size() * 4, texels32f.data());
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    GLint row_length_after = 0;
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length_after);
+    EXPECT_EQ(row_length_after, row_length);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    EXPECT_EQ(columns_in_front_of_stored_depth(*context, textures[1]), "....xxxx"sv);
+
+    // UNSIGNED_INT_24_8, with texSubImage2D() into a texture allocated without data.
+    glBindTexture(GL_TEXTURE_2D, textures[2]);
+    context->tex_storage2d(GL_TEXTURE_2D, 1, GL_DEPTH24_STENCIL8, 8, 8);
+    context->tex_sub_image2d_robust_angle(GL_TEXTURE_2D, 0, 0, 0, 8, 8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, texels24.size() * 4, texels24.data());
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(columns_in_front_of_stored_depth(*context, textures[2]), "....xxxx"sv);
+
+    context->delete_textures(3, textures);
+}
