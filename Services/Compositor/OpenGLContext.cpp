@@ -51,9 +51,16 @@ struct OpenGLContext::Impl {
     EGLContext context { EGL_NO_CONTEXT };
     EGLSurface surface { EGL_NO_SURFACE };
 
+    // The drawing buffer's color, which gets painted. With antialiasing, the page draws into msaa_framebuffer instead,
+    // and it gets resolved into this one, see resolve_drawing_buffer().
     GLuint framebuffer { 0 };
     GLuint color_buffer { 0 };
+    // The depth and stencil of the framebuffer the page draws into (multisampled with antialiasing).
     GLuint depth_buffer { 0 };
+    GLuint msaa_framebuffer { 0 };
+    GLuint msaa_color_buffer { 0 };
+    // Whether a multisampled drawing buffer resolves correctly, found out once, see allocate_msaa_drawing_buffer().
+    Optional<bool> msaa_works {};
     EGLint texture_target { 0 };
     bool uses_cpu_painting_surface { false };
 
@@ -117,6 +124,16 @@ void OpenGLContext::free_surface_resources()
     if (m_impl->depth_buffer) {
         glDeleteRenderbuffers(1, &m_impl->depth_buffer);
         m_impl->depth_buffer = 0;
+    }
+
+    if (m_impl->msaa_framebuffer) {
+        glDeleteFramebuffers(1, &m_impl->msaa_framebuffer);
+        m_impl->msaa_framebuffer = 0;
+    }
+
+    if (m_impl->msaa_color_buffer) {
+        glDeleteRenderbuffers(1, &m_impl->msaa_color_buffer);
+        m_impl->msaa_color_buffer = 0;
     }
 
     if (m_impl->readback_buffer) {
@@ -541,7 +558,8 @@ void OpenGLContext::read_default_framebuffer(u32 pixel_pack_buffer, void* destin
     if (m_webgl_version == WebGLVersion::WebGL2)
         glGetIntegerv(GL_READ_BUFFER, &original_read_buffer);
 
-    glBindFramebuffer(framebuffer_target, default_framebuffer());
+    resolve_drawing_buffer();
+    glBindFramebuffer(framebuffer_target, m_impl->framebuffer);
     if (m_webgl_version == WebGLVersion::WebGL2)
         glReadBuffer(GL_COLOR_ATTACHMENT0);
 
@@ -648,6 +666,9 @@ void OpenGLContext::allocate_painting_surface_if_needed()
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_impl->texture_target == EGL_TEXTURE_RECTANGLE_ANGLE ? GL_TEXTURE_RECTANGLE_ANGLE : GL_TEXTURE_2D, m_impl->color_buffer, 0);
 
     auto stencil = m_drawing_buffer_options.stencil && drawing_buffer_can_have_stencil();
+    if (drawing_buffer_can_have_antialias() && allocate_msaa_drawing_buffer(stencil))
+        return;
+
     if (m_drawing_buffer_options.depth || stencil) {
         glGenRenderbuffers(1, &m_impl->depth_buffer);
         glBindRenderbuffer(GL_RENDERBUFFER, m_impl->depth_buffer);
@@ -667,6 +688,170 @@ void OpenGLContext::allocate_painting_surface_if_needed()
 
     VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
 #endif
+}
+
+// Antialiasing gives the drawing buffer a multisampled framebuffer to draw into, which gets resolved into the one that
+// is painted. It needs OpenGL ES 3 for multisampled renderbuffers and glBlitFramebuffer(), so only WebGL 2 gets it:
+// WebGL 1 contexts are OpenGL ES 2 contexts.
+bool OpenGLContext::drawing_buffer_can_have_antialias()
+{
+#ifdef ENABLE_WEBGL
+    return m_drawing_buffer_options.antialias && m_webgl_version == WebGLVersion::WebGL2 && m_impl->msaa_works != false;
+#else
+    return false;
+#endif
+}
+
+bool OpenGLContext::drawing_buffer_has_antialias()
+{
+    make_current();
+    return m_impl->msaa_framebuffer != 0;
+}
+
+// Adds the multisampled framebuffer the page draws into, with the drawing buffer's depth and stencil, to
+// m_impl->framebuffer, which then just keeps the color. Returns false, allocating nothing, where that doesn't work.
+bool OpenGLContext::allocate_msaa_drawing_buffer(bool stencil)
+{
+#ifdef ENABLE_WEBGL
+    GLint max_samples = 0;
+    glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+    // 4 samples is what other browsers use, and what every OpenGL ES 3 implementation supports.
+    auto samples = min(max_samples, 4);
+    if (samples < 2) {
+        m_impl->msaa_works = false;
+        return false;
+    }
+
+    glGenFramebuffers(1, &m_impl->msaa_framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_impl->msaa_framebuffer);
+
+    // The color must match the resolve target's format exactly, which glTexImage2D(GL_RGBA, GL_UNSIGNED_BYTE) makes RGBA8.
+    glGenRenderbuffers(1, &m_impl->msaa_color_buffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_impl->msaa_color_buffer);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, m_size.width(), m_size.height());
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_impl->msaa_color_buffer);
+
+    if (m_drawing_buffer_options.depth || stencil) {
+        glGenRenderbuffers(1, &m_impl->depth_buffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, m_impl->depth_buffer);
+        if (m_drawing_buffer_options.depth && stencil) {
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        } else if (m_drawing_buffer_options.depth) {
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT24, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        } else {
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_STENCIL_INDEX8, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        }
+    }
+
+    // Find out once whether this works here, before the page has issued any GL commands, so that checking glGetError()
+    // can't swallow one of its errors: the resolve target's format differs on some painting surfaces.
+    if (!m_impl->msaa_works.has_value()) {
+        while (glGetError() != GL_NO_ERROR) { }
+        bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (complete)
+            resolve_drawing_buffer();
+        m_impl->msaa_works = complete && glGetError() == GL_NO_ERROR;
+    }
+
+    if (!*m_impl->msaa_works) {
+        glDeleteFramebuffers(1, &m_impl->msaa_framebuffer);
+        glDeleteRenderbuffers(1, &m_impl->msaa_color_buffer);
+        if (m_impl->depth_buffer)
+            glDeleteRenderbuffers(1, &m_impl->depth_buffer);
+        m_impl->msaa_framebuffer = 0;
+        m_impl->msaa_color_buffer = 0;
+        m_impl->depth_buffer = 0;
+        glBindFramebuffer(GL_FRAMEBUFFER, m_impl->framebuffer);
+        return false;
+    }
+
+    VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+    return true;
+#else
+    (void)stencil;
+    return false;
+#endif
+}
+
+// Brings the painted framebuffer up to date with what the page drew into the multisampled one. Only the color gets
+// resolved: resolving multisampled depth can remove the GPU device with Mesa's d3d12 driver, see blit_framebuffer().
+void OpenGLContext::resolve_drawing_buffer()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->msaa_framebuffer)
+        return;
+
+    GLint original_read_framebuffer = 0;
+    GLint original_draw_framebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &original_read_framebuffer);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &original_draw_framebuffer);
+    // The scissor test applies to blits, and the page's scissor rectangle mustn't.
+    GLboolean scissor_test = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissor_test)
+        glDisable(GL_SCISSOR_TEST);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_impl->msaa_framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_impl->framebuffer);
+    glBlitFramebuffer(0, 0, m_size.width(), m_size.height(), 0, 0, m_size.width(), m_size.height(), GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    if (scissor_test)
+        glEnable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, original_read_framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, original_draw_framebuffer);
+#endif
+}
+
+// The page reads the drawing buffer's pixels from the resolved framebuffer, as a multisampled one can't be read.
+// Returns whether it redirected the read framebuffer, which end_reading_drawing_buffer() then undoes.
+bool OpenGLContext::begin_reading_drawing_buffer()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->msaa_framebuffer)
+        return false;
+    GLint read_framebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+    if (static_cast<GLuint>(read_framebuffer) != m_impl->msaa_framebuffer)
+        return false;
+    resolve_drawing_buffer();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_impl->framebuffer);
+    return true;
+#else
+    return false;
+#endif
+}
+
+void OpenGLContext::end_reading_drawing_buffer(bool redirected)
+{
+#ifdef ENABLE_WEBGL
+    if (redirected)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, m_impl->msaa_framebuffer);
+#else
+    (void)redirected;
+#endif
+}
+
+void OpenGLContext::read_pixels_robust_angle(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, GLsizei* length, GLsizei* columns, GLsizei* rows, void* pixels)
+{
+    auto redirected = begin_reading_drawing_buffer();
+    GLFunctions::read_pixels_robust_angle(x, y, width, height, format, type, buf_size, length, columns, rows, pixels);
+    end_reading_drawing_buffer(redirected);
+}
+
+void OpenGLContext::copy_tex_image2d(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
+{
+    auto redirected = begin_reading_drawing_buffer();
+    GLFunctions::copy_tex_image2d(target, level, internalformat, x, y, width, height, border);
+    end_reading_drawing_buffer(redirected);
+}
+
+void OpenGLContext::copy_tex_sub_image2d(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    auto redirected = begin_reading_drawing_buffer();
+    GLFunctions::copy_tex_sub_image2d(target, level, xoffset, yoffset, x, y, width, height);
+    end_reading_drawing_buffer(redirected);
 }
 
 bool OpenGLContext::drawing_buffer_has_stencil()
@@ -718,6 +903,18 @@ void OpenGLContext::blit_framebuffer(GLint src_x0, GLint src_y0, GLint src_x1, G
         mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         if (!mask)
             return;
+    }
+
+    // Blitting color from an antialiased drawing buffer reads the resolved one, like any other read of its pixels. Its
+    // depth and stencil stay in the multisampled framebuffer.
+    if (mask & GL_COLOR_BUFFER_BIT) {
+        if (auto redirected = begin_reading_drawing_buffer()) {
+            GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, GL_COLOR_BUFFER_BIT, filter);
+            end_reading_drawing_buffer(redirected);
+            mask &= ~GL_COLOR_BUFFER_BIT;
+            if (!mask)
+                return;
+        }
     }
 #endif
     GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
@@ -1032,6 +1229,9 @@ void OpenGLContext::present()
     }
 #    endif
 
+    // The painting surface is the resolved framebuffer's color.
+    resolve_drawing_buffer();
+
     // "Before the drawing buffer is presented for compositing the implementation shall ensure that all rendering operations have been flushed to the drawing buffer."
     // With Metal, glFlush flushes the command buffer, but without waiting for it to be scheduled or completed.
     // eglWaitUntilWorkScheduledANGLE flushes the command buffer, and waits until it has been scheduled, hence the name.
@@ -1118,6 +1318,9 @@ u32 OpenGLContext::default_renderbuffer() const
 
 u32 OpenGLContext::default_framebuffer() const
 {
+    // The page draws into the multisampled framebuffer, when there is one.
+    if (m_impl->msaa_framebuffer)
+        return m_impl->msaa_framebuffer;
     return m_impl->framebuffer;
 }
 

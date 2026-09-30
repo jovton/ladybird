@@ -99,11 +99,13 @@ Optional<RemoteWebGLContext> create_remote_webgl_context(HTML::CanvasHost& canva
 }
 
 // The actual context parameters are the requested ones, except for what the drawing buffer couldn't get: with Mesa's
-// d3d12 driver, it has no stencil buffer, see OpenGLContext::drawing_buffer_can_have_stencil().
+// d3d12 driver, it has no stencil buffer, see OpenGLContext::drawing_buffer_can_have_stencil(), and only WebGL 2
+// contexts are antialiased, see OpenGLContext::drawing_buffer_can_have_antialias().
 static WebGLContextAttributes actual_context_attributes(WebGLContextAttributes const& requested, RemoteWebGLTransport::CreateResult const& result)
 {
     auto actual = requested;
     actual.stencil = result.stencil;
+    actual.antialias = result.antialias;
     return actual;
 }
 
