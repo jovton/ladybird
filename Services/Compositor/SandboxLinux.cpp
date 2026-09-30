@@ -157,6 +157,8 @@ ErrorOr<void> restrict_filesystem(StringView resource_root)
 
     Vector<Sandbox::LandlockPath> paths;
     TRY(Sandbox::add_landlock_path_if_exists(paths, TRY(String::formatted("{}/fonts", resource_root)), Sandbox::LandlockPath::Access::ReadOnly));
+    // Text is hinted the way fontconfig's configuration says, see Gfx::Font::hinting_options().
+    TRY(Sandbox::add_fontconfig_configuration_paths(paths));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/lib"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/lib64"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/lib"sv, Sandbox::LandlockPath::Access::ReadOnly));

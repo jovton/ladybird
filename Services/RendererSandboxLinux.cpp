@@ -29,6 +29,8 @@ ErrorOr<void> apply_sandbox(StringView, Optional<StringView>, AudioAccess audio_
     TRY(Sandbox::add_landlock_path_if_exists(paths, executable_path, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, LexicalPath::join(build_root, "lib"sv).string(), Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/proc/self"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    // Text is hinted the way fontconfig's configuration says, see Gfx::Font::hinting_options().
+    TRY(Sandbox::add_fontconfig_configuration_paths(paths));
     if (audio_access == AudioAccess::Yes) {
         // NB: Connecting is not a path operation, so the broker is what reaches the socket. libpulse
         //     still has to find it, and pa_make_secure_dir() opens the directory the socket lives in
