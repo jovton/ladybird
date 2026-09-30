@@ -439,3 +439,82 @@ TEST_CASE(stencil_substitutions_are_not_remembered_wrongly)
     glDeleteFramebuffers(1, &framebuffer);
     context->delete_textures(1, &texture);
 }
+
+// On d3d12, depth-stencil data gets repacked before GL has validated the upload, see drop_stencil_from_upload(). Sizes
+// whose arithmetic overflows must be left to GL to reject, not repacked into a buffer that's too small.
+TEST_CASE(huge_depth_stencil_uploads_are_rejected_safely)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    u32 data[16] {};
+    GLuint textures[2] {};
+    glGenTextures(2, textures);
+    auto start = MonotonicTime::now();
+
+    // Offsets and the repacked size wrap around to 0 in 64 bits.
+    glBindTexture(GL_TEXTURE_2D_ARRAY, textures[0]);
+    context->tex_image3d_robust_angle(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH32F_STENCIL8, 1 << 30, 1 << 30, 4, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, sizeof(data), data);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+
+    // A row length far longer than the data.
+    glBindTexture(GL_TEXTURE_2D, textures[1]);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0x7fffffff);
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH32F_STENCIL8, 2, 2, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, sizeof(data), data);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    EXPECT((MonotonicTime::now() - start) < AK::Duration::from_seconds(1));
+    context->delete_textures(2, textures);
+}
+
+// A call GL rejects leaves a renderbuffer or texture image as it was, including a depth-only one that got its format
+// instead of a depth-stencil one on d3d12. It must stay attachable as depth-stencil, even when the rejected call had the
+// same size.
+TEST_CASE(rejected_allocations_keep_depth_only_images_attachable)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    GLuint framebuffer = 0;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+
+    GLuint renderbuffer = 0;
+    glGenRenderbuffers(1, &renderbuffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+    context->renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 8, 8);
+    context->renderbuffer_storage(GL_RENDERBUFFER, 0x1234, 8, 8);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, renderbuffer);
+    EXPECT_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
+    // RGBA8 can't be uploaded from floats, so GL rejects this, though its size is fine.
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_RGBA8, 8, 8, 0, GL_RGBA, GL_FLOAT, 0, nullptr);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    context->framebuffer_texture2d(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, texture, 0);
+    EXPECT_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
+
+    glDeleteFramebuffers(1, &framebuffer);
+    context->delete_renderbuffers(1, &renderbuffer);
+    context->delete_textures(1, &texture);
+}
