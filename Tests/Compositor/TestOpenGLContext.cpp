@@ -370,3 +370,69 @@ TEST_CASE(depth_stencil_data_keeps_its_depth)
 
     context->delete_textures(3, textures);
 }
+
+// On d3d12 the Compositor remembers which renderbuffers and texture images got a depth-only format instead of one with
+// stencil, and adjusts how they're attached, see OpenGLContext::framebuffer_renderbuffer(). What it remembers must stay
+// true: it must be forgotten when a renderbuffer is deleted, as GL reuses names, and not change when GL rejects an
+// allocation, as that leaves the renderbuffer or texture as it was.
+TEST_CASE(stencil_substitutions_are_not_remembered_wrongly)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    GLuint framebuffer = 0;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    auto attachment_type = [](GLenum attachment) {
+        GLint type = GL_NONE;
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+        return type;
+    };
+
+    // A renderbuffer that reuses the name of a deleted stencil renderbuffer, attached as depth before it gets storage.
+    GLuint renderbuffer = 0;
+    glGenRenderbuffers(1, &renderbuffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+    context->renderbuffer_storage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, 8, 8);
+    context->delete_renderbuffers(1, &renderbuffer);
+    GLuint reused = 0;
+    glGenRenderbuffers(1, &reused);
+    if (reused != renderbuffer)
+        warnln("GL gave the new renderbuffer another name, so this doesn't test reuse");
+    glBindRenderbuffer(GL_RENDERBUFFER, reused);
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, reused);
+    EXPECT_EQ(attachment_type(GL_DEPTH_ATTACHMENT), GL_RENDERBUFFER);
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+
+    // A depth renderbuffer, which a stencil allocation GL rejects must leave a depth renderbuffer.
+    context->renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, 8, 8);
+    GLint max_size = 0;
+    glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_size);
+    context->renderbuffer_storage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, max_size + 1, 8);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, reused);
+    EXPECT_EQ(attachment_type(GL_DEPTH_ATTACHMENT), GL_RENDERBUFFER);
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+    context->delete_renderbuffers(1, &reused);
+
+    // A depth-stencil texture, which a second texStorage2D() that GL rejects (the texture already has storage) must leave
+    // as it was: attached as depth-stencil, the framebuffer must be complete.
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    context->tex_storage2d(GL_TEXTURE_2D, 1, GL_DEPTH24_STENCIL8, 8, 8);
+    context->tex_storage2d(GL_TEXTURE_2D, 1, GL_RGBA8, 8, 8);
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    context->framebuffer_texture2d(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, texture, 0);
+    EXPECT_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
+
+    glDeleteFramebuffers(1, &framebuffer);
+    context->delete_textures(1, &texture);
+}
