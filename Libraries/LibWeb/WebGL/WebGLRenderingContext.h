@@ -59,7 +59,8 @@ private:
 bool fire_webgl_context_event(HTML::CanvasHost&, Utf16FlyString const& type);
 void fire_webgl_context_creation_error(HTML::CanvasHost&);
 
-OwnPtr<WebGLContextProxy> create_webgl_context_proxy(HTML::CanvasHost&, WebGLVersion, WebGLContextAttributes const&);
-bool restore_webgl_context_proxy(WebGLContextProxy&, HTML::CanvasHost&, WebGLVersion, WebGLContextAttributes const&);
+// Both create the drawing buffer the page asked for, and report what it actually got, which can differ.
+OwnPtr<WebGLContextProxy> create_webgl_context_proxy(HTML::CanvasHost&, WebGLVersion, WebGLContextAttributes const& requested, WebGLContextAttributes& actual);
+bool restore_webgl_context_proxy(WebGLContextProxy&, HTML::CanvasHost&, WebGLVersion, WebGLContextAttributes const& requested, WebGLContextAttributes& actual);
 
 }

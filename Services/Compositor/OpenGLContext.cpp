@@ -669,6 +669,12 @@ void OpenGLContext::allocate_painting_surface_if_needed()
 #endif
 }
 
+bool OpenGLContext::drawing_buffer_has_stencil()
+{
+    make_current();
+    return m_drawing_buffer_options.stencil && drawing_buffer_can_have_stencil();
+}
+
 bool OpenGLContext::drawing_buffer_can_have_stencil()
 {
 #ifdef ENABLE_WEBGL

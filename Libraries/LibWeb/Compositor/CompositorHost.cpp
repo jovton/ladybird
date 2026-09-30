@@ -140,7 +140,7 @@ private:
     {
         VERIFY(!m_canvas_id.has_value());
         CreateResult result;
-        auto canvas_id = m_connection->create_webgl_context(webgl_version, initial_size, depth, stencil, antialias, result.supported_extensions);
+        auto canvas_id = m_connection->create_webgl_context(webgl_version, initial_size, depth, stencil, antialias, result.stencil, result.supported_extensions);
         if (canvas_id.has_value()) {
             result.success = true;
             m_canvas_id = *canvas_id;

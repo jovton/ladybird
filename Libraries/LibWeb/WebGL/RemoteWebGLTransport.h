@@ -29,6 +29,8 @@ public:
     struct CreateResult {
         bool success { false };
         Vector<String> supported_extensions;
+        // Whether the drawing buffer really has a stencil buffer. It can lack one the page asked for.
+        bool stencil { false };
     };
     virtual CreateResult create_context(WebGLVersion, Gfx::IntSize initial_size, bool depth, bool stencil, bool antialias) = 0;
     virtual Optional<Compositing::CanvasId> canvas_id() const = 0;
