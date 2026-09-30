@@ -78,6 +78,7 @@ public:
     void framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
     void framebuffer_texture_layer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);
     void delete_textures(GLsizei n, GLuint const* textures);
+    void delete_renderbuffers(GLsizei n, GLuint const* renderbuffers);
     // With antialiasing, these read the page's drawing buffer from the resolved framebuffer, see begin_reading_drawing_buffer().
     void read_pixels_robust_angle(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, GLsizei* length, GLsizei* columns, GLsizei* rows, void* pixels);
     void copy_tex_image2d(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border);
@@ -113,6 +114,8 @@ private:
     bool uses_mesa_d3d12();
     bool read_framebuffer_has_unresolvable_depth();
     GLenum renderbuffer_format_for(GLenum);
+    void note_renderbuffer_storage(GLenum requested_format, GLenum format, GLsizei width, GLsizei height);
+    bool tex_image_can_succeed(GLenum target, GLsizei width, GLsizei height, GLsizei depth, GLint border);
     void note_texture_stencil(GLenum target, GLint first_level, GLint level_count, bool has_stencil_dropped);
     bool bound_texture_image_has_stencil_dropped(GLenum target, GLint level);
     void attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level);
