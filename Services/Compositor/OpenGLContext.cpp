@@ -941,27 +941,70 @@ GLenum OpenGLContext::renderbuffer_format_for(GLenum format)
 #ifdef ENABLE_WEBGL
     // Pages can give framebuffers of their own a stencil buffer, which runs into the same device loss with Mesa's d3d12
     // driver as the drawing buffer does, see drawing_buffer_can_have_stencil(). So they get depth only there, too.
-    GLint renderbuffer = 0;
-    glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
-    auto depth_only_format = uses_mesa_d3d12() ? format_without_stencil(format) : format;
-    if (depth_only_format != format)
-        m_impl->renderbuffers_without_stencil.set(renderbuffer, format);
-    else
-        m_impl->renderbuffers_without_stencil.remove(renderbuffer);
-    return depth_only_format;
+    return uses_mesa_d3d12() ? format_without_stencil(format) : format;
 #else
     return format;
 #endif
 }
 
+// Records the format substitution of the bound renderbuffer, once GL has allocated its storage. GL can reject the
+// allocation, keeping the renderbuffer as it was, so this goes by what the renderbuffer actually got. That can't use
+// glGetError(), which would take the error from the page.
+void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum format, GLsizei width, GLsizei height)
+{
+#ifdef ENABLE_WEBGL
+    if (!uses_mesa_d3d12())
+        return;
+    GLint renderbuffer = 0;
+    GLint allocated_format = GL_NONE;
+    GLint allocated_width = 0;
+    GLint allocated_height = 0;
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
+    if (!renderbuffer)
+        return;
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_INTERNAL_FORMAT, &allocated_format);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &allocated_width);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &allocated_height);
+    // A substituted format is always sized, so GL reports it as it is. Otherwise, all that matters is that the stencil
+    // substitution is gone.
+    bool substituted = format != requested_format;
+    bool allocated = allocated_width == width && allocated_height == height && (!substituted || static_cast<GLenum>(allocated_format) == format);
+    if (!allocated)
+        return;
+    if (substituted)
+        m_impl->renderbuffers_without_stencil.set(static_cast<GLuint>(renderbuffer), requested_format);
+    else
+        m_impl->renderbuffers_without_stencil.remove(static_cast<GLuint>(renderbuffer));
+#else
+    (void)requested_format;
+    (void)format;
+    (void)width;
+    (void)height;
+#endif
+}
+
 void OpenGLContext::renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
-    GLFunctions::renderbuffer_storage(target, renderbuffer_format_for(internalformat), width, height);
+    auto format = renderbuffer_format_for(internalformat);
+    GLFunctions::renderbuffer_storage(target, format, width, height);
+    note_renderbuffer_storage(internalformat, format, width, height);
 }
 
 void OpenGLContext::renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
 {
-    GLFunctions::renderbuffer_storage_multisample(target, samples, renderbuffer_format_for(internalformat), width, height);
+    auto format = renderbuffer_format_for(internalformat);
+    GLFunctions::renderbuffer_storage_multisample(target, samples, format, width, height);
+    note_renderbuffer_storage(internalformat, format, width, height);
+}
+
+void OpenGLContext::delete_renderbuffers(GLsizei n, GLuint const* renderbuffers)
+{
+#ifdef ENABLE_WEBGL
+    // GL may give a deleted renderbuffer's name to a new one, which must not inherit the old one's substitution.
+    for (GLsizei i = 0; i < n; ++i)
+        m_impl->renderbuffers_without_stencil.remove(renderbuffers[i]);
+#endif
+    GLFunctions::delete_renderbuffers(n, renderbuffers);
 }
 
 void OpenGLContext::framebuffer_renderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
@@ -1168,14 +1211,32 @@ void OpenGLContext::note_texture_stencil(GLenum target, GLint first_level, GLint
     }
 }
 
+// Whether the texture bound to target is immutable, i.e. has storage from texStorage2D()/texStorage3D(), and how many levels
+// it got. Only WebGL 2 contexts have immutable textures.
+static Optional<GLint> immutable_levels_of_bound_texture(GLenum target)
+{
+    auto parameter_target = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? GL_TEXTURE_CUBE_MAP : target;
+    GLint immutable = GL_FALSE;
+    glGetTexParameteriv(parameter_target, GL_TEXTURE_IMMUTABLE_FORMAT, &immutable);
+    if (!immutable)
+        return {};
+    GLint levels = 0;
+    glGetTexParameteriv(parameter_target, GL_TEXTURE_IMMUTABLE_LEVELS, &levels);
+    return levels;
+}
+
 void OpenGLContext::tex_storage2d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
 {
 #ifdef ENABLE_WEBGL
     if (uses_mesa_d3d12() && texture_binding_for(target) != GL_NONE) {
         auto depth_only_format = depth_only_format_for(internalformat);
-        if (is_valid_level_count(levels, width, height))
+        // GL rejects storage for a texture that already has some, and impossible level counts, keeping the texture as it
+        // was. Only a texture that GL made immutable with these levels got them.
+        bool was_immutable = immutable_levels_of_bound_texture(target).has_value();
+        GLFunctions::tex_storage2d(target, levels, depth_only_format, width, height);
+        if (!was_immutable && is_valid_level_count(levels, width, height) && immutable_levels_of_bound_texture(target) == levels)
             note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
-        internalformat = depth_only_format;
+        return;
     }
 #endif
     GLFunctions::tex_storage2d(target, levels, internalformat, width, height);
@@ -1186,10 +1247,12 @@ void OpenGLContext::tex_storage3d(GLenum target, GLsizei levels, GLenum internal
 #ifdef ENABLE_WEBGL
     if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY) {
         auto depth_only_format = depth_only_format_for(internalformat);
+        bool was_immutable = immutable_levels_of_bound_texture(target).has_value();
+        GLFunctions::tex_storage3d(target, levels, depth_only_format, width, height, depth);
         // The layers of a 2D array texture don't get smaller with its mip levels.
-        if (is_valid_level_count(levels, width, height))
+        if (!was_immutable && is_valid_level_count(levels, width, height) && immutable_levels_of_bound_texture(target) == levels)
             note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
-        internalformat = depth_only_format;
+        return;
     }
 #endif
     GLFunctions::tex_storage3d(target, levels, internalformat, width, height, depth);
@@ -1201,7 +1264,8 @@ void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint i
     Optional<DepthOnlyUpload> upload;
     if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0 && level <= max_mip_level) {
         upload = drop_stencil_from_upload(&internalformat, format, type, width, height, 1, buf_size, pixels, false);
-        note_texture_stencil(target, level, 1, upload.has_value());
+        if (tex_image_can_succeed(target, width, height, 1, border))
+            note_texture_stencil(target, level, 1, upload.has_value());
     }
     UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
@@ -1214,11 +1278,37 @@ void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint i
     Optional<DepthOnlyUpload> upload;
     if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0 && level <= max_mip_level) {
         upload = drop_stencil_from_upload(&internalformat, format, type, width, height, depth, buf_size, pixels, true);
-        note_texture_stencil(target, level, 1, upload.has_value());
+        if (tex_image_can_succeed(target, width, height, depth, border))
+            note_texture_stencil(target, level, 1, upload.has_value());
     }
     UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
+}
+
+// texImage2D()/texImage3D() leave the texture as it was when GL rejects them, so their substitution must only be recorded
+// when they can succeed. There's no way to ask GL afterwards (OpenGL ES 3.0 can't query a texture level's format), and
+// glGetError() would take the error from the page, so this rules out what GL is sure to reject.
+bool OpenGLContext::tex_image_can_succeed(GLenum target, GLsizei width, GLsizei height, GLsizei depth, GLint border)
+{
+    if (border != 0 || width < 0 || height < 0 || depth < 0)
+        return false;
+    if (m_webgl_version == WebGLVersion::WebGL2 && immutable_levels_of_bound_texture(target).has_value())
+        return false;
+    bool is_cube_map_face = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+    if (is_cube_map_face && width != height)
+        return false;
+    GLint max_size = 0;
+    glGetIntegerv(is_cube_map_face ? GL_MAX_CUBE_MAP_TEXTURE_SIZE : GL_MAX_TEXTURE_SIZE, &max_size);
+    if (width > max_size || height > max_size)
+        return false;
+    if (target == GL_TEXTURE_2D_ARRAY) {
+        GLint max_layers = 0;
+        glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &max_layers);
+        if (depth > max_layers)
+            return false;
+    }
+    return true;
 }
 
 // Whether the image at the given level of the texture bound to target got a depth-only format, see note_texture_stencil().
