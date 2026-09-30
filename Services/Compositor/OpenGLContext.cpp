@@ -1025,22 +1025,120 @@ static GLenum depth_only_format_for(GLenum internalformat)
     return internalformat;
 }
 
-// For texImage2D()/texImage3D() without data, which is how render targets get made: turns a depth-stencil upload into a
-// depth-only one. Uploads with data keep their stencil, as the data would have to be converted.
-static bool drop_stencil_from_upload(GLint& internalformat, GLenum& format, GLenum& type, void const* pixels)
+// GL accepts 1 to log2(largest dimension) + 1 mip levels, and rejects other counts, allocating nothing. Nothing may be
+// tracked for those either: a page asking for 2^31 levels would otherwise keep the Compositor busy for minutes.
+static bool is_valid_level_count(GLsizei levels, GLsizei width, GLsizei height)
 {
-    if (pixels || format != GL_DEPTH_STENCIL_OES)
+    if (levels < 1 || width < 1 || height < 1)
         return false;
-    if (internalformat == GL_DEPTH32F_STENCIL8) {
-        internalformat = GL_DEPTH_COMPONENT32F;
+    auto largest = static_cast<u32>(max(width, height));
+    GLsizei max_levels = 1;
+    while (largest >>= 1)
+        ++max_levels;
+    return levels <= max_levels;
+}
+
+// No texture can have mip levels beyond this, whatever its size, so GL rejects them.
+static constexpr GLint max_mip_level = 31;
+
+// A depth-stencil upload, turned into a depth-only one by drop_stencil_from_upload().
+struct DepthOnlyUpload {
+    // Set when the data had to be repacked. It's tightly packed, unlike the page's data, see UnpackStateOverride.
+    ByteBuffer repacked;
+};
+
+// Turns a depth-stencil upload into a depth-only one. Without data, which is how render targets get made, that only means
+// other formats. UNSIGNED_INT_24_8 data keeps its depth in the upper 24 bits of each 32-bit texel, which is exactly
+// what uploading the same bytes as UNSIGNED_INT into a 24-bit depth format keeps. FLOAT_32_UNSIGNED_INT_24_8_REV data
+// has 8 bytes per texel, a float depth followed by the stencil, so its depths get repacked. Returns nothing if the upload
+// isn't depth-stencil, or if the data is too short, in which case GL rejects the upload anyway.
+static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat, GLenum& format, GLenum& type, GLsizei width, GLsizei height, GLsizei depth, GLsizei& buf_size, void const*& pixels, bool is_3d)
+{
+    if (format != GL_DEPTH_STENCIL_OES || width < 0 || height < 0 || depth < 0)
+        return {};
+
+    DepthOnlyUpload upload;
+    if (type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) {
+        if (pixels) {
+            GLint alignment = 4, row_length = 0, skip_pixels = 0, skip_rows = 0, image_height = 0, skip_images = 0;
+            glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+            glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+            glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+            glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+            if (is_3d) {
+                glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &image_height);
+                glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_images);
+            }
+
+            // The page's data is laid out the way GL reads it, see "Unpacking" in the OpenGL ES 3.0 spec.
+            constexpr u64 texel_size = 8;
+            u64 row_stride = static_cast<u64>(row_length > 0 ? row_length : width) * texel_size;
+            row_stride = (row_stride + alignment - 1) / alignment * alignment;
+            u64 image_stride = row_stride * static_cast<u64>(image_height > 0 ? image_height : height);
+            auto offset_of = [&](u64 x, u64 y, u64 z) {
+                return (skip_images + z) * image_stride + (skip_rows + y) * row_stride + (skip_pixels + x) * texel_size;
+            };
+            if (width > 0 && height > 0 && depth > 0 && offset_of(width - 1, height - 1, depth - 1) + texel_size > static_cast<u64>(buf_size))
+                return {};
+
+            auto repacked = ByteBuffer::create_uninitialized(static_cast<size_t>(width) * height * depth * sizeof(float));
+            if (repacked.is_error())
+                return {};
+            upload.repacked = repacked.release_value();
+            auto const* source = static_cast<u8 const*>(pixels);
+            auto* destination = upload.repacked.data();
+            for (GLsizei z = 0; z < depth; ++z) {
+                for (GLsizei y = 0; y < height; ++y) {
+                    for (GLsizei x = 0; x < width; ++x) {
+                        memcpy(destination, source + offset_of(x, y, z), sizeof(float));
+                        destination += sizeof(float);
+                    }
+                }
+            }
+            pixels = upload.repacked.data();
+            buf_size = static_cast<GLsizei>(upload.repacked.size());
+        }
+        if (internalformat)
+            *internalformat = GL_DEPTH_COMPONENT32F;
         type = GL_FLOAT;
-    } else {
-        internalformat = internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT;
+    } else if (type == GL_UNSIGNED_INT_24_8_OES) {
+        if (internalformat)
+            *internalformat = *internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT;
         type = GL_UNSIGNED_INT;
+    } else {
+        return {};
     }
     format = GL_DEPTH_COMPONENT;
-    return true;
+    return upload;
 }
+
+// Sets tightly packed unpack state for uploading repacked data, and puts the page's back afterwards.
+class UnpackStateOverride {
+public:
+    explicit UnpackStateOverride(bool active)
+        : m_active(active)
+    {
+        if (!m_active)
+            return;
+        for (size_t i = 0; i < parameters.size(); ++i) {
+            glGetIntegerv(parameters[i], &m_saved[i]);
+            glPixelStorei(parameters[i], parameters[i] == GL_UNPACK_ALIGNMENT ? 4 : 0);
+        }
+    }
+
+    ~UnpackStateOverride()
+    {
+        if (!m_active)
+            return;
+        for (size_t i = 0; i < parameters.size(); ++i)
+            glPixelStorei(parameters[i], m_saved[i]);
+    }
+
+private:
+    static constexpr Array<GLenum, 6> parameters { GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_ROWS, GL_UNPACK_IMAGE_HEIGHT, GL_UNPACK_SKIP_IMAGES };
+    bool m_active { false };
+    Array<GLint, 6> m_saved {};
+};
 
 void OpenGLContext::note_texture_stencil(GLenum target, GLint first_level, GLint level_count, bool has_stencil_dropped)
 {
@@ -1075,7 +1173,8 @@ void OpenGLContext::tex_storage2d(GLenum target, GLsizei levels, GLenum internal
 #ifdef ENABLE_WEBGL
     if (uses_mesa_d3d12() && texture_binding_for(target) != GL_NONE) {
         auto depth_only_format = depth_only_format_for(internalformat);
-        note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
+        if (is_valid_level_count(levels, width, height))
+            note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
         internalformat = depth_only_format;
     }
 #endif
@@ -1087,7 +1186,9 @@ void OpenGLContext::tex_storage3d(GLenum target, GLsizei levels, GLenum internal
 #ifdef ENABLE_WEBGL
     if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY) {
         auto depth_only_format = depth_only_format_for(internalformat);
-        note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
+        // The layers of a 2D array texture don't get smaller with its mip levels.
+        if (is_valid_level_count(levels, width, height))
+            note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
         internalformat = depth_only_format;
     }
 #endif
@@ -1097,8 +1198,12 @@ void OpenGLContext::tex_storage3d(GLenum target, GLsizei levels, GLenum internal
 void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
 {
 #ifdef ENABLE_WEBGL
-    if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0)
-        note_texture_stencil(target, level, 1, drop_stencil_from_upload(internalformat, format, type, pixels));
+    Optional<DepthOnlyUpload> upload;
+    if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0 && level <= max_mip_level) {
+        upload = drop_stencil_from_upload(&internalformat, format, type, width, height, 1, buf_size, pixels, false);
+        note_texture_stencil(target, level, 1, upload.has_value());
+    }
+    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
 }
@@ -1106,10 +1211,49 @@ void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint i
 void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
 {
 #ifdef ENABLE_WEBGL
-    if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0)
-        note_texture_stencil(target, level, 1, drop_stencil_from_upload(internalformat, format, type, pixels));
+    Optional<DepthOnlyUpload> upload;
+    if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0 && level <= max_mip_level) {
+        upload = drop_stencil_from_upload(&internalformat, format, type, width, height, depth, buf_size, pixels, true);
+        note_texture_stencil(target, level, 1, upload.has_value());
+    }
+    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
+}
+
+// Whether the image at the given level of the texture bound to target got a depth-only format, see note_texture_stencil().
+bool OpenGLContext::bound_texture_image_has_stencil_dropped(GLenum target, GLint level)
+{
+    auto kind = texture_image_kind(target);
+    auto binding = texture_binding_for(target);
+    if (!kind.has_value() || binding == GL_NONE || level < 0 || level > max_mip_level)
+        return false;
+    GLint texture = 0;
+    glGetIntegerv(binding, &texture);
+    return m_impl->texture_images_without_stencil.contains(texture_image_key(static_cast<GLuint>(texture), *kind, level));
+}
+
+// Depth-stencil data for an image that got a depth-only format has to become depth-only data as well, or GL rejects it.
+void OpenGLContext::tex_sub_image2d_robust_angle(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    Optional<DepthOnlyUpload> upload;
+    if (format == GL_DEPTH_STENCIL_OES && !m_impl->texture_images_without_stencil.is_empty() && bound_texture_image_has_stencil_dropped(target, level))
+        upload = drop_stencil_from_upload(nullptr, format, type, width, height, 1, buf_size, pixels, false);
+    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+#endif
+    GLFunctions::tex_sub_image2d_robust_angle(target, level, xoffset, yoffset, width, height, format, type, buf_size, pixels);
+}
+
+void OpenGLContext::tex_sub_image3d_robust_angle(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    Optional<DepthOnlyUpload> upload;
+    if (format == GL_DEPTH_STENCIL_OES && !m_impl->texture_images_without_stencil.is_empty() && bound_texture_image_has_stencil_dropped(target, level))
+        upload = drop_stencil_from_upload(nullptr, format, type, width, height, depth, buf_size, pixels, true);
+    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+#endif
+    GLFunctions::tex_sub_image3d_robust_angle(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, buf_size, pixels);
 }
 
 // A texture image that has no stencil can only be the depth attachment.
