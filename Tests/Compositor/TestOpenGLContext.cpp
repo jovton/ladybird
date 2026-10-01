@@ -484,6 +484,31 @@ TEST_CASE(huge_depth_stencil_uploads_are_rejected_safely)
     context->delete_textures(2, textures);
 }
 
+// Depth-stencil data only goes with depth-stencil internal formats, whatever d3d12 turns those into.
+TEST_CASE(depth_stencil_data_for_other_internal_formats_is_rejected)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_RGBA8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_INVALID_OPERATION));
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0, nullptr);
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_INVALID_OPERATION));
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    context->delete_textures(1, &texture);
+}
+
 // A call GL rejects leaves a renderbuffer or texture image as it was, including a depth-only one that got its format
 // instead of a depth-stencil one on d3d12. It must stay attachable as depth-stencil, even when the rejected call had the
 // same size.

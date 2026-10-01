@@ -1151,6 +1151,16 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
     if (format != GL_DEPTH_STENCIL_OES || width < 0 || height < 0 || depth < 0)
         return {};
 
+    // Only the internal formats that go with the data become depth-only, anything else (like GL_RGBA8 with depth-stencil
+    // data) reaches GL unchanged, which rejects it. Uploads into existing images (texSubImage) have no internal format.
+    if (internalformat) {
+        bool matches = type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV
+            ? *internalformat == GL_DEPTH32F_STENCIL8
+            : *internalformat == GL_DEPTH24_STENCIL8 || *internalformat == GL_DEPTH_STENCIL_OES;
+        if (!matches)
+            return {};
+    }
+
     DepthOnlyUpload upload;
     if (type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) {
         if (pixels && width > 0 && height > 0 && depth > 0) {
