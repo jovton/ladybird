@@ -18,6 +18,7 @@
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 #include <link.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace Compositor {
@@ -26,7 +27,9 @@ namespace Compositor {
 // the library directories, which are already allowed. A path, which may be relative to the manifest, can be anywhere,
 // and the library may load its own dependencies from next to it (e.g. a libEGL_mesa with RUNPATH $ORIGIN that needs a
 // matching libgallium), so its whole directory is allowed. Otherwise the dynamic loader would skip to the system's copy
-// of a dependency with the same name, or fail.
+// of a dependency with the same name, or fail. Landlock goes by the file a path resolves to, so where the library is a
+// symlink to one elsewhere, that directory doesn't cover it: the library itself is allowed as well, and the directory
+// it really is in, along with the dependencies next to it (which the symlinks next to the link may point to).
 static ErrorOr<void> add_manifest_library_paths(Vector<Sandbox::LandlockPath>& paths, StringView manifest_path)
 {
     auto file = Core::File::open(manifest_path, Core::File::OpenMode::Read);
@@ -42,7 +45,14 @@ static ErrorOr<void> add_manifest_library_paths(Vector<Sandbox::LandlockPath>& p
         if (!library_path.has_value() || !library_path->contains('/'))
             return {};
         auto path = LexicalPath::absolute_path(LexicalPath::dirname(manifest_path), *library_path);
-        return Sandbox::add_landlock_path_if_exists(paths, LexicalPath::dirname(path), Sandbox::LandlockPath::Access::ReadOnly);
+        TRY(Sandbox::add_landlock_path_if_exists(paths, path, Sandbox::LandlockPath::Access::ReadOnly));
+        TRY(Sandbox::add_landlock_path_if_exists(paths, LexicalPath::dirname(path), Sandbox::LandlockPath::Access::ReadOnly));
+        auto* resolved_path = realpath(path.characters(), nullptr);
+        if (!resolved_path)
+            return {};
+        auto resolved_directory = LexicalPath::dirname(ByteString { resolved_path });
+        free(resolved_path);
+        return Sandbox::add_landlock_path_if_exists(paths, resolved_directory, Sandbox::LandlockPath::Access::ReadOnly);
     };
 
     auto const& object = manifest.value().as_object();
