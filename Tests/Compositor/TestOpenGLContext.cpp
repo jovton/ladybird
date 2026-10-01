@@ -468,6 +468,18 @@ TEST_CASE(huge_depth_stencil_uploads_are_rejected_safely)
     EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
+    // Rows and images that overlap: the data ends after 48 MiB, but its 2^63 texels would repack into 0 bytes.
+    constexpr GLsizei overlapping_size = 1 << 21;
+    Vector<u8> overlapping_data;
+    overlapping_data.resize(3 * overlapping_size * 8);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, textures[0]);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 1);
+    glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 1);
+    context->tex_image3d_robust_angle(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH32F_STENCIL8, overlapping_size, overlapping_size, overlapping_size, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, overlapping_data.size(), overlapping_data.data());
+    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+
     EXPECT((MonotonicTime::now() - start) < AK::Duration::from_seconds(1));
     context->delete_textures(2, textures);
 }
