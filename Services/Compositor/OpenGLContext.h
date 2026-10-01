@@ -66,6 +66,8 @@ public:
 
     // Works around a driver bug before passing the call on to GL, see the definition.
     void blit_framebuffer(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter);
+    // Reports errors that checking the page's calls took from GL first, see blit_framebuffer_would_succeed().
+    GLenum get_error();
     void renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
     void renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
     void framebuffer_renderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
@@ -111,6 +113,9 @@ private:
     void resolve_drawing_buffer();
     bool begin_reading_drawing_buffer();
     void end_reading_drawing_buffer(bool redirected);
+    bool reads_antialiased_drawing_buffer();
+    bool blit_framebuffer_would_succeed(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter);
+    void take_errors_from_gl();
     bool uses_mesa_d3d12();
     bool read_framebuffer_has_unresolvable_depth();
     GLenum renderbuffer_format_for(GLenum);
