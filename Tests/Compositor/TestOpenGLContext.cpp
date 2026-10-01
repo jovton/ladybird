@@ -707,3 +707,82 @@ TEST_CASE(depth24_data_keeps_every_bit_of_its_depth)
     context->delete_textures(1, &texture);
 }
 
+// GL attaches an image given as depth-stencil to both attachment points, replacing what either had. An image that got a
+// depth-only format on d3d12 must replace both as well, but only if GL accepts the call.
+TEST_CASE(depth_stencil_attachments_replace_both_attachment_points)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    GLuint framebuffer = 0;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    auto attached_name = [](GLenum attachment) {
+        GLint name = 0;
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+        return static_cast<GLuint>(name);
+    };
+
+    // A depth renderbuffer the page attaches itself, which the depth-stencil attachments below must replace.
+    GLuint old_depth = 0;
+    glGenRenderbuffers(1, &old_depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, old_depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, 8, 8);
+
+    GLuint renderbuffers[2] {};
+    glGenRenderbuffers(2, renderbuffers);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffers[0]);
+    context->renderbuffer_storage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, 8, 8);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffers[1]);
+    context->renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 8, 8);
+
+    // A stencil renderbuffer replaces the depth attachment.
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, old_depth);
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, renderbuffers[0]);
+    EXPECT_NE(attached_name(GL_DEPTH_ATTACHMENT), old_depth);
+
+    // A depth-stencil renderbuffer replaces the stencil attachment.
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, old_depth);
+    context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, renderbuffers[1]);
+    EXPECT_EQ(attached_name(GL_DEPTH_ATTACHMENT), renderbuffers[1]);
+    EXPECT_NE(attached_name(GL_STENCIL_ATTACHMENT), old_depth);
+
+    // So do depth-stencil textures, with framebufferTexture2D() and framebufferTextureLayer().
+    GLuint textures[2] {};
+    glGenTextures(2, textures);
+    glBindTexture(GL_TEXTURE_2D, textures[0]);
+    context->tex_storage2d(GL_TEXTURE_2D, 1, GL_DEPTH24_STENCIL8, 8, 8);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, textures[1]);
+    context->tex_storage3d(GL_TEXTURE_2D_ARRAY, 1, GL_DEPTH24_STENCIL8, 8, 8, 2);
+
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, old_depth);
+    context->framebuffer_texture2d(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, textures[0], 0);
+    EXPECT_EQ(attached_name(GL_DEPTH_ATTACHMENT), textures[0]);
+    EXPECT_NE(attached_name(GL_STENCIL_ATTACHMENT), old_depth);
+
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, old_depth);
+    context->framebuffer_texture_layer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, textures[1], 0, 1);
+    EXPECT_EQ(attached_name(GL_DEPTH_ATTACHMENT), textures[1]);
+    EXPECT_NE(attached_name(GL_STENCIL_ATTACHMENT), old_depth);
+
+    // A call GL rejects changes neither.
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, old_depth);
+    context->framebuffer_texture2d(0x1234, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, textures[0], 0);
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(attached_name(GL_STENCIL_ATTACHMENT), old_depth);
+    context->framebuffer_renderbuffer(0x1234, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, renderbuffers[1]);
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(attached_name(GL_STENCIL_ATTACHMENT), old_depth);
+
+    glDeleteFramebuffers(1, &framebuffer);
+    context->delete_renderbuffers(2, renderbuffers);
+    glDeleteRenderbuffers(1, &old_depth);
+    context->delete_textures(2, textures);
+}
