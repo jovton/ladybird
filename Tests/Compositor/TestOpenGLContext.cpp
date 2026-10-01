@@ -630,7 +630,8 @@ TEST_CASE(rejected_allocations_keep_depth_only_images_attachable)
 }
 
 // UNSIGNED_INT_24_8 data must keep every bit of its depths, whatever their stencils, when the texture gets a depth-only
-// format on d3d12, see low_bits_of_depth24(). A shader reads the depths back as 24-bit integers.
+// format on d3d12, see low_bits_of_depth24(). A shader reads the depths back as 24-bit integers. The data is small enough
+// to live inside the repacked ByteBuffer, which the upload must use where it ends up.
 TEST_CASE(depth24_data_keeps_every_bit_of_its_depth)
 {
     auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
@@ -674,7 +675,7 @@ TEST_CASE(depth24_data_keeps_every_bit_of_its_depth)
     auto program = glCreateProgram();
     glAttachShader(program, compile(GL_VERTEX_SHADER, "#version 300 es\nin vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }"));
     glAttachShader(program, compile(GL_FRAGMENT_SHADER, "#version 300 es\nprecision highp float; uniform highp sampler2D t; out uvec4 o;\n"
-                                                        "void main() { o = uvec4(uint(texelFetch(t, ivec2(gl_FragCoord.xy), 0).r * 16777215.0 + 0.5)); }"));
+                                                        "void main() { o = uvec4(uint(round(texelFetch(t, ivec2(gl_FragCoord.xy), 0).r * 16777215.0))); }"));
     glBindAttribLocation(program, 0, "p");
     glLinkProgram(program);
     glUseProgram(program);
