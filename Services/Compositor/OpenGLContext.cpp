@@ -1089,13 +1089,30 @@ void OpenGLContext::framebuffer_renderbuffer(GLenum target, GLenum attachment, G
     if (auto original_format = m_impl->renderbuffers_without_stencil.get(renderbuffer); original_format.has_value()) {
         // The renderbuffer has no stencil, so it can only be the depth attachment, if the page wanted depth from it.
         bool has_depth = *original_format != GL_STENCIL_INDEX8;
-        if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
-            attachment = has_depth ? GL_DEPTH_ATTACHMENT : GL_STENCIL_ATTACHMENT;
+        if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+            attach_as_depth_and_detach_stencil([&](GLenum attachment, bool detach) {
+                GLFunctions::framebuffer_renderbuffer(target, attachment, renderbuffertarget, detach || !has_depth ? 0 : renderbuffer);
+            });
+            return;
+        }
         if (attachment == GL_STENCIL_ATTACHMENT || (attachment == GL_DEPTH_ATTACHMENT && !has_depth))
             renderbuffer = 0;
     }
 #endif
     GLFunctions::framebuffer_renderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+}
+
+// GL attaches an image given as depth-stencil to both the depth and the stencil attachment point, replacing what either
+// had. One that got a depth-only format can only go to the depth point, but the stencil point still has to lose what it
+// had, as it would have with GL. It does so only once GL has accepted the image as depth, as a call GL rejects changes
+// nothing. attach(attachment, detach) makes the page's call for that attachment point, attaching nothing if detach is
+// set.
+void OpenGLContext::attach_as_depth_and_detach_stencil(Function<void(GLenum, bool)> const& attach)
+{
+    take_errors_from_gl();
+    attach(GL_DEPTH_ATTACHMENT, false);
+    if (take_errors_from_gl() == 0)
+        attach(GL_STENCIL_ATTACHMENT, true);
 }
 
 // Depth-stencil textures run into the same device loss with Mesa's d3d12 driver as stencil renderbuffers do (clearing
@@ -1492,22 +1509,28 @@ void OpenGLContext::tex_sub_image3d_robust_angle(GLenum target, GLint level, GLi
     GLFunctions::tex_sub_image3d_robust_angle(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, buf_size, pixels);
 }
 
-// A texture image that has no stencil can only be the depth attachment.
-void OpenGLContext::attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level)
+// A texture image that has no stencil can only be the depth attachment. Returns whether it's attached as depth-stencil,
+// which takes attach_as_depth_and_detach_stencil().
+bool OpenGLContext::attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level)
 {
     if (!m_impl->texture_images_without_stencil.contains(texture_image_key(texture, kind, level)))
-        return;
+        return false;
     if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
-        attachment = GL_DEPTH_ATTACHMENT;
-    else if (attachment == GL_STENCIL_ATTACHMENT)
+        return true;
+    if (attachment == GL_STENCIL_ATTACHMENT)
         texture = 0;
+    return false;
 }
 
 void OpenGLContext::framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
 {
 #ifdef ENABLE_WEBGL
-    if (auto kind = texture_image_kind(textarget); kind.has_value() && texture != 0)
-        attach_texture_image_without_stencil(attachment, texture, *kind, level);
+    if (auto kind = texture_image_kind(textarget); kind.has_value() && texture != 0 && attach_texture_image_without_stencil(attachment, texture, *kind, level)) {
+        attach_as_depth_and_detach_stencil([&](GLenum attachment, bool detach) {
+            GLFunctions::framebuffer_texture2d(target, attachment, textarget, detach ? 0 : texture, level);
+        });
+        return;
+    }
 #endif
     GLFunctions::framebuffer_texture2d(target, attachment, textarget, texture, level);
 }
@@ -1516,8 +1539,12 @@ void OpenGLContext::framebuffer_texture_layer(GLenum target, GLenum attachment, 
 {
 #ifdef ENABLE_WEBGL
     // Of the textures with layers, only 2D arrays can hold depth.
-    if (texture != 0)
-        attach_texture_image_without_stencil(attachment, texture, *texture_image_kind(GL_TEXTURE_2D_ARRAY), level);
+    if (texture != 0 && attach_texture_image_without_stencil(attachment, texture, *texture_image_kind(GL_TEXTURE_2D_ARRAY), level)) {
+        attach_as_depth_and_detach_stencil([&](GLenum attachment, bool detach) {
+            GLFunctions::framebuffer_texture_layer(target, attachment, detach ? 0 : texture, level, layer);
+        });
+        return;
+    }
 #endif
     GLFunctions::framebuffer_texture_layer(target, attachment, texture, level, layer);
 }
