@@ -628,3 +628,79 @@ TEST_CASE(rejected_allocations_keep_depth_only_images_attachable)
     context->delete_renderbuffers(1, &renderbuffer);
     context->delete_textures(1, &texture);
 }
+
+// UNSIGNED_INT_24_8 data must keep every bit of its depths, whatever their stencils, when the texture gets a depth-only
+// format on d3d12, see low_bits_of_depth24(). A shader reads the depths back as 24-bit integers.
+TEST_CASE(depth24_data_keeps_every_bit_of_its_depth)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, drawing_buffer_options);
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    while (glGetError() != GL_NO_ERROR) { }
+
+    constexpr Array<u32, 8> depths { 0, 1, 0xffff, 0x7fffff, 0x800000, 0xabcdef, 0xfffffe, 0xffffff };
+    Array<u32, 8> texels {};
+    for (size_t i = 0; i < depths.size(); ++i)
+        texels[i] = depths[i] << 8 | 0xff;
+
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 1, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, sizeof(texels), texels.data());
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    GLuint framebuffer = 0;
+    GLuint color = 0;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glGenRenderbuffers(1, &color);
+    glBindRenderbuffer(GL_RENDERBUFFER, color);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_R32UI, 8, 1);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, color);
+
+    auto compile = [](GLenum type, char const* source) {
+        auto shader = glCreateShader(type);
+        glShaderSource(shader, 1, &source, nullptr);
+        glCompileShader(shader);
+        return shader;
+    };
+    auto program = glCreateProgram();
+    glAttachShader(program, compile(GL_VERTEX_SHADER, "#version 300 es\nin vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }"));
+    glAttachShader(program, compile(GL_FRAGMENT_SHADER, "#version 300 es\nprecision highp float; uniform highp sampler2D t; out uvec4 o;\n"
+                                                        "void main() { o = uvec4(uint(texelFetch(t, ivec2(gl_FragCoord.xy), 0).r * 16777215.0 + 0.5)); }"));
+    glBindAttribLocation(program, 0, "p");
+    glLinkProgram(program);
+    glUseProgram(program);
+    GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+    GLuint buffer = 0;
+    glGenBuffers(1, &buffer);
+    glBindBuffer(GL_ARRAY_BUFFER, buffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glViewport(0, 0, 8, 1);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    Array<u32, 8 * 4> pixels {};
+    glReadPixels(0, 0, 8, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, pixels.data());
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    for (size_t i = 0; i < depths.size(); ++i) {
+        if (pixels[i * 4] != depths[i])
+            warnln("depth {:#x} came back as {:#x}", depths[i], pixels[i * 4]);
+        EXPECT_EQ(pixels[i * 4], depths[i]);
+    }
+
+    glDeleteBuffers(1, &buffer);
+    glDeleteProgram(program);
+    glDeleteRenderbuffers(1, &color);
+    glDeleteFramebuffers(1, &framebuffer);
+    context->delete_textures(1, &texture);
+}
+

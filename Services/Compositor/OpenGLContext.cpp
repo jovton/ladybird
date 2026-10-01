@@ -988,6 +988,18 @@ GLenum OpenGLContext::get_error()
     return GLFunctions::get_error();
 }
 
+// Keeps an error for get_error() that a call of the page's gets without reaching GL. Errors GL has from earlier calls
+// must have been taken first, as they come before it.
+void OpenGLContext::keep_error(GLenum error)
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->errors_taken_from_gl.contains_slow(error))
+        m_impl->errors_taken_from_gl.append(error);
+#else
+    (void)error;
+#endif
+}
+
 // Picks a depth-only format for a format with stencil, or returns the format as it is.
 static GLenum format_without_stencil(GLenum format)
 {
@@ -1152,16 +1164,106 @@ static constexpr GLint max_mip_level = 31;
 struct DepthOnlyUpload {
     // Set when the data had to be repacked. It's tightly packed, unlike the page's data, see UnpackStateOverride.
     ByteBuffer repacked;
+    // Set when the data couldn't be repacked. The upload must then not reach GL at all, see drop_stencil_from_upload().
+    GLenum error { GL_NO_ERROR };
 };
 
+// The low bits that make a 24-bit depth exact as UNSIGNED_INT depth data. GL turns such data into a depth by dividing it
+// by 2^32 - 1, so depth << 8 alone comes out up to a step lower than depth / (2^24 - 1). These bits make the 32-bit value
+// at least that, and less than a 256th of a step more, which keeps the depth whether GL rounds, truncates or shifts.
+static u32 low_bits_of_depth24(u32 depth)
+{
+    return static_cast<u32>((static_cast<u64>(depth) * 255 + 0xfffffe) / 0xffffff);
+}
+
+// Repacks the depths of depth-stencil data into tightly packed depth-only data of 4 bytes per texel. An UNSIGNED_INT_24_8
+// texel keeps its depth in its upper 24 bits and its stencil in the lower 8, which become UNSIGNED_INT data without the
+// stencil. A FLOAT_32_UNSIGNED_INT_24_8_REV texel has 8 bytes, a float depth followed by the stencil, which become FLOAT
+// data. Data that GL would reject gets the error GL gives it, so that the upload never needs GL to see it.
+static ErrorOr<ByteBuffer, GLenum> repack_depths(GLenum type, GLsizei width, GLsizei height, GLsizei depth, GLsizei buf_size, void const* pixels, bool is_3d)
+{
+    GLint alignment = 4, row_length = 0, skip_pixels = 0, skip_rows = 0, image_height = 0, skip_images = 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    if (is_3d) {
+        glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &image_height);
+        glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_images);
+    }
+    if (alignment < 1 || row_length < 0 || skip_pixels < 0 || skip_rows < 0 || image_height < 0 || skip_images < 0)
+        return GL_INVALID_OPERATION;
+
+    // The page's data is laid out the way GL reads it, see "Unpacking" in the OpenGL ES 3.0 spec. All of this is
+    // page-controlled and not validated by GL yet, so every step is checked for overflow. Data whose end overflows can't
+    // fit in buf_size, which GL rejects as INVALID_OPERATION. Once the end of the data is known to fit in buf_size, no
+    // offset of a texel before it can overflow.
+    u64 const texel_size = type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV ? 8 : 4;
+    Checked<u64> row_stride = static_cast<u64>(row_length > 0 ? row_length : width);
+    row_stride *= texel_size;
+    row_stride += static_cast<u64>(alignment - 1);
+    if (row_stride.has_overflow())
+        return GL_INVALID_OPERATION;
+    u64 aligned_row_stride = row_stride.value() / static_cast<u64>(alignment) * static_cast<u64>(alignment);
+    Checked<u64> image_stride = aligned_row_stride;
+    image_stride *= static_cast<u64>(image_height > 0 ? image_height : height);
+    if (image_stride.has_overflow())
+        return GL_INVALID_OPERATION;
+
+    Checked<u64> end = static_cast<u64>(skip_images) + static_cast<u64>(depth) - 1;
+    end *= image_stride.value();
+    Checked<u64> rows = static_cast<u64>(skip_rows) + static_cast<u64>(height) - 1;
+    rows *= aligned_row_stride;
+    end += rows;
+    Checked<u64> pixels_in_row = static_cast<u64>(skip_pixels) + static_cast<u64>(width);
+    pixels_in_row *= texel_size;
+    end += pixels_in_row;
+    if (end.has_overflow() || end.value() > static_cast<u64>(max(buf_size, 0)))
+        return GL_INVALID_OPERATION;
+
+    auto offset_of = [&](u64 x, u64 y, u64 z) {
+        return (static_cast<u64>(skip_images) + z) * image_stride.value() + (static_cast<u64>(skip_rows) + y) * aligned_row_stride + (static_cast<u64>(skip_pixels) + x) * texel_size;
+    };
+    // The data's end doesn't bound the repacked size: rows and images can overlap (e.g. UNPACK_ROW_LENGTH = 1), so the
+    // texel count can be far larger, up to overflowing. Like a repacked size that doesn't fit buf_size's type, that's
+    // more than GL could allocate a texture for.
+    Checked<size_t> repacked_size = static_cast<size_t>(width);
+    repacked_size *= static_cast<size_t>(height);
+    repacked_size *= static_cast<size_t>(depth);
+    repacked_size *= sizeof(u32);
+    if (repacked_size.has_overflow() || repacked_size.value() > static_cast<size_t>(NumericLimits<GLsizei>::max()))
+        return GL_OUT_OF_MEMORY;
+    auto repacked_or_error = ByteBuffer::create_uninitialized(repacked_size.value());
+    if (repacked_or_error.is_error())
+        return GL_OUT_OF_MEMORY;
+    auto repacked = repacked_or_error.release_value();
+
+    auto const* source = static_cast<u8 const*>(pixels);
+    auto* destination = repacked.data();
+    for (GLsizei z = 0; z < depth; ++z) {
+        for (GLsizei y = 0; y < height; ++y) {
+            for (GLsizei x = 0; x < width; ++x) {
+                u32 texel = 0;
+                memcpy(&texel, source + offset_of(x, y, z), sizeof(u32));
+                if (type == GL_UNSIGNED_INT_24_8_OES)
+                    texel = (texel & 0xffffff00) | low_bits_of_depth24(texel >> 8);
+                memcpy(destination, &texel, sizeof(u32));
+                destination += sizeof(u32);
+            }
+        }
+    }
+    return repacked;
+}
+
 // Turns a depth-stencil upload into a depth-only one. Without data, which is how render targets get made, that only means
-// other formats. UNSIGNED_INT_24_8 data keeps its depth in the upper 24 bits of each 32-bit texel, which is exactly
-// what uploading the same bytes as UNSIGNED_INT into a 24-bit depth format keeps. FLOAT_32_UNSIGNED_INT_24_8_REV data
-// has 8 bytes per texel, a float depth followed by the stencil, so its depths get repacked. Returns nothing if the upload
-// isn't depth-stencil, or if the data is too short, in which case GL rejects the upload anyway.
+// other formats, otherwise the data gets repacked, see repack_depths(). Returns nothing if the upload isn't depth-stencil,
+// which leaves it to GL unchanged. Once it is, the original upload must not reach GL, as GL would then allocate the
+// stencil this exists to avoid: if the data can't be repacked, the result has the error the upload gets instead.
 static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat, GLenum& format, GLenum& type, GLsizei width, GLsizei height, GLsizei depth, GLsizei& buf_size, void const*& pixels, bool is_3d)
 {
     if (format != GL_DEPTH_STENCIL_OES || width < 0 || height < 0 || depth < 0)
+        return {};
+    if (type != GL_UNSIGNED_INT_24_8_OES && type != GL_FLOAT_32_UNSIGNED_INT_24_8_REV)
         return {};
 
     // Only the internal formats that go with the data become depth-only, anything else (like GL_RGBA8 with depth-stencil
@@ -1175,85 +1277,24 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
     }
 
     DepthOnlyUpload upload;
-    if (type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) {
-        if (pixels && width > 0 && height > 0 && depth > 0) {
-            GLint alignment = 4, row_length = 0, skip_pixels = 0, skip_rows = 0, image_height = 0, skip_images = 0;
-            glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
-            glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
-            glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
-            glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
-            if (is_3d) {
-                glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &image_height);
-                glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_images);
-            }
-            if (alignment < 1 || row_length < 0 || skip_pixels < 0 || skip_rows < 0 || image_height < 0 || skip_images < 0)
-                return {};
-
-            // The page's data is laid out the way GL reads it, see "Unpacking" in the OpenGL ES 3.0 spec. All of this is
-            // page-controlled and not validated by GL yet, so every step is checked for overflow, and an overflow leaves
-            // the upload to GL, which rejects it. Once the end of the data is known to fit in buf_size, no offset of a
-            // texel before it can overflow.
-            constexpr u64 texel_size = 8;
-            Checked<u64> row_stride = static_cast<u64>(row_length > 0 ? row_length : width);
-            row_stride *= texel_size;
-            row_stride += static_cast<u64>(alignment - 1);
-            if (row_stride.has_overflow())
-                return {};
-            u64 aligned_row_stride = row_stride.value() / static_cast<u64>(alignment) * static_cast<u64>(alignment);
-            Checked<u64> image_stride = aligned_row_stride;
-            image_stride *= static_cast<u64>(image_height > 0 ? image_height : height);
-            if (image_stride.has_overflow())
-                return {};
-
-            Checked<u64> end = static_cast<u64>(skip_images) + static_cast<u64>(depth) - 1;
-            end *= image_stride.value();
-            Checked<u64> rows = static_cast<u64>(skip_rows) + static_cast<u64>(height) - 1;
-            rows *= aligned_row_stride;
-            end += rows;
-            Checked<u64> pixels_in_row = static_cast<u64>(skip_pixels) + static_cast<u64>(width);
-            pixels_in_row *= texel_size;
-            end += pixels_in_row;
-            if (end.has_overflow() || end.value() > static_cast<u64>(max(buf_size, 0)))
-                return {};
-
-            auto offset_of = [&](u64 x, u64 y, u64 z) {
-                return (static_cast<u64>(skip_images) + z) * image_stride.value() + (static_cast<u64>(skip_rows) + y) * aligned_row_stride + (static_cast<u64>(skip_pixels) + x) * texel_size;
-            };
-            // The data's end doesn't bound the repacked size: rows and images can overlap (e.g. UNPACK_ROW_LENGTH = 1), so
-            // the texel count can be far larger, up to overflowing. Like the overflows above, such uploads are left to GL
-            // unchanged, and so is anything whose repacked size doesn't fit buf_size's type.
-            Checked<size_t> repacked_size = static_cast<size_t>(width);
-            repacked_size *= static_cast<size_t>(height);
-            repacked_size *= static_cast<size_t>(depth);
-            repacked_size *= sizeof(float);
-            if (repacked_size.has_overflow() || repacked_size.value() > static_cast<size_t>(NumericLimits<GLsizei>::max()))
-                return {};
-            auto repacked = ByteBuffer::create_uninitialized(repacked_size.value());
-            if (repacked.is_error())
-                return {};
-            upload.repacked = repacked.release_value();
-            auto const* source = static_cast<u8 const*>(pixels);
-            auto* destination = upload.repacked.data();
-            for (GLsizei z = 0; z < depth; ++z) {
-                for (GLsizei y = 0; y < height; ++y) {
-                    for (GLsizei x = 0; x < width; ++x) {
-                        memcpy(destination, source + offset_of(x, y, z), sizeof(float));
-                        destination += sizeof(float);
-                    }
-                }
-            }
-            pixels = upload.repacked.data();
-            buf_size = static_cast<GLsizei>(upload.repacked.size());
+    if (pixels && width > 0 && height > 0 && depth > 0) {
+        auto repacked = repack_depths(type, width, height, depth, buf_size, pixels, is_3d);
+        if (repacked.is_error()) {
+            upload.error = repacked.error();
+            return upload;
         }
+        upload.repacked = repacked.release_value();
+        pixels = upload.repacked.data();
+        buf_size = static_cast<GLsizei>(upload.repacked.size());
+    }
+    if (type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) {
         if (internalformat)
             *internalformat = GL_DEPTH_COMPONENT32F;
         type = GL_FLOAT;
-    } else if (type == GL_UNSIGNED_INT_24_8_OES) {
+    } else {
         if (internalformat)
             *internalformat = *internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT;
         type = GL_UNSIGNED_INT;
-    } else {
-        return {};
     }
     format = GL_DEPTH_COMPONENT;
     return upload;
@@ -1368,6 +1409,10 @@ void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint i
     if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0 && level <= max_mip_level) {
         auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, 1, buf_size, pixels, false);
         take_errors_from_gl();
+        if (upload.has_value() && upload->error != GL_NO_ERROR) {
+            keep_error(upload->error);
+            return;
+        }
         {
             UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
             GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
@@ -1386,6 +1431,10 @@ void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint i
     if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0 && level <= max_mip_level) {
         auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, depth, buf_size, pixels, true);
         take_errors_from_gl();
+        if (upload.has_value() && upload->error != GL_NO_ERROR) {
+            keep_error(upload->error);
+            return;
+        }
         {
             UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
             GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
@@ -1417,6 +1466,11 @@ void OpenGLContext::tex_sub_image2d_robust_angle(GLenum target, GLint level, GLi
     Optional<DepthOnlyUpload> upload;
     if (format == GL_DEPTH_STENCIL_OES && !m_impl->texture_images_without_stencil.is_empty() && bound_texture_image_has_stencil_dropped(target, level))
         upload = drop_stencil_from_upload(nullptr, format, type, width, height, 1, buf_size, pixels, false);
+    if (upload.has_value() && upload->error != GL_NO_ERROR) {
+        take_errors_from_gl();
+        keep_error(upload->error);
+        return;
+    }
     UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_sub_image2d_robust_angle(target, level, xoffset, yoffset, width, height, format, type, buf_size, pixels);
@@ -1428,6 +1482,11 @@ void OpenGLContext::tex_sub_image3d_robust_angle(GLenum target, GLint level, GLi
     Optional<DepthOnlyUpload> upload;
     if (format == GL_DEPTH_STENCIL_OES && !m_impl->texture_images_without_stencil.is_empty() && bound_texture_image_has_stencil_dropped(target, level))
         upload = drop_stencil_from_upload(nullptr, format, type, width, height, depth, buf_size, pixels, true);
+    if (upload.has_value() && upload->error != GL_NO_ERROR) {
+        take_errors_from_gl();
+        keep_error(upload->error);
+        return;
+    }
     UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_sub_image3d_robust_angle(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, buf_size, pixels);
