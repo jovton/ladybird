@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Function.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
@@ -123,7 +124,8 @@ private:
     void note_renderbuffer_storage(GLenum requested_format, GLenum format);
     void note_texture_stencil(GLenum target, GLint first_level, GLint level_count, bool has_stencil_dropped);
     bool bound_texture_image_has_stencil_dropped(GLenum target, GLint level);
-    void attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level);
+    bool attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level);
+    void attach_as_depth_and_detach_stencil(Function<void(GLenum, bool)> const& attach);
 #if defined(AK_OS_MACOS)
     void allocate_iosurface_painting_surface();
 #endif
