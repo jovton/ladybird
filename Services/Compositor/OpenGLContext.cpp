@@ -1169,7 +1169,7 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
             // The page's data is laid out the way GL reads it, see "Unpacking" in the OpenGL ES 3.0 spec. All of this is
             // page-controlled and not validated by GL yet, so every step is checked for overflow, and an overflow leaves
             // the upload to GL, which rejects it. Once the end of the data is known to fit in buf_size, no offset of a
-            // texel before it can overflow, and the repacked data is at most half its size.
+            // texel before it can overflow.
             constexpr u64 texel_size = 8;
             Checked<u64> row_stride = static_cast<u64>(row_length > 0 ? row_length : width);
             row_stride *= texel_size;
@@ -1196,7 +1196,16 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
             auto offset_of = [&](u64 x, u64 y, u64 z) {
                 return (static_cast<u64>(skip_images) + z) * image_stride.value() + (static_cast<u64>(skip_rows) + y) * aligned_row_stride + (static_cast<u64>(skip_pixels) + x) * texel_size;
             };
-            auto repacked = ByteBuffer::create_uninitialized(static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(depth) * sizeof(float));
+            // The data's end doesn't bound the repacked size: rows and images can overlap (e.g. UNPACK_ROW_LENGTH = 1), so
+            // the texel count can be far larger, up to overflowing. Like the overflows above, such uploads are left to GL
+            // unchanged, and so is anything whose repacked size doesn't fit buf_size's type.
+            Checked<size_t> repacked_size = static_cast<size_t>(width);
+            repacked_size *= static_cast<size_t>(height);
+            repacked_size *= static_cast<size_t>(depth);
+            repacked_size *= sizeof(float);
+            if (repacked_size.has_overflow() || repacked_size.value() > static_cast<size_t>(NumericLimits<GLsizei>::max()))
+                return {};
+            auto repacked = ByteBuffer::create_uninitialized(repacked_size.value());
             if (repacked.is_error())
                 return {};
             upload.repacked = repacked.release_value();
