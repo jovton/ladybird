@@ -90,6 +90,9 @@ struct OpenGLContext::Impl {
     // The same for texture images, see tex_storage2d(). A key names one attachable image: the texture, which of its
     // images (see texture_image_kind()) and the mip level, see texture_image_key().
     HashTable<u64> texture_images_without_stencil {};
+
+    // Errors taken from GL while checking a call of the page's, which get_error() reports before GL's own.
+    Vector<GLenum, 4> errors_taken_from_gl {};
 };
 
 OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
@@ -813,15 +816,25 @@ void OpenGLContext::resolve_drawing_buffer()
 bool OpenGLContext::begin_reading_drawing_buffer()
 {
 #ifdef ENABLE_WEBGL
-    if (!m_impl->msaa_framebuffer)
-        return false;
-    GLint read_framebuffer = 0;
-    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
-    if (static_cast<GLuint>(read_framebuffer) != m_impl->msaa_framebuffer)
+    if (!reads_antialiased_drawing_buffer())
         return false;
     resolve_drawing_buffer();
     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_impl->framebuffer);
     return true;
+#else
+    return false;
+#endif
+}
+
+// Whether the read framebuffer is the page's drawing buffer, and that is antialiased.
+bool OpenGLContext::reads_antialiased_drawing_buffer()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->msaa_framebuffer)
+        return false;
+    GLint read_framebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+    return static_cast<GLuint>(read_framebuffer) == m_impl->msaa_framebuffer;
 #else
     return false;
 #endif
@@ -927,16 +940,20 @@ void OpenGLContext::blit_framebuffer(GLint src_x0, GLint src_y0, GLint src_x1, G
     // With Mesa's d3d12 driver on WSL2 (seen with Mesa 26.2 on an Intel GPU), resolving the depth of a multisampled
     // framebuffer removes the GPU device, unless its depth buffer is DEPTH_COMPONENT16 or DEPTH_COMPONENT32F: nothing
     // gets drawn from then on, in any WebGL context of the process. three.js does this for every multisampled render
-    // target. Resolving just the color keeps pages working, as few of them read the resolved depth back.
-    if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) && uses_mesa_d3d12() && read_framebuffer_has_unresolvable_depth()) {
+    // target. Resolving just the color keeps pages working, as few of them read the resolved depth back. Only valid calls
+    // get that: GL rejects depth or stencil with GL_LINEAR before blitting anything.
+    if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) && filter == GL_NEAREST && uses_mesa_d3d12() && read_framebuffer_has_unresolvable_depth()) {
         mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         if (!mask)
             return;
     }
 
     // Blitting color from an antialiased drawing buffer reads the resolved one, like any other read of its pixels. Its
-    // depth and stencil stay in the multisampled framebuffer.
+    // depth and stencil stay in the multisampled framebuffer, so blitting them as well takes two calls. GL checks each
+    // on its own, but the page's call has to fail as a whole, without blitting either part, so GL checks it first.
     if (mask & GL_COLOR_BUFFER_BIT) {
+        if ((mask & ~GL_COLOR_BUFFER_BIT) && reads_antialiased_drawing_buffer() && !blit_framebuffer_would_succeed(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter))
+            return;
         if (auto redirected = begin_reading_drawing_buffer()) {
             GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, GL_COLOR_BUFFER_BIT, filter);
             end_reading_drawing_buffer(redirected);
@@ -947,6 +964,52 @@ void OpenGLContext::blit_framebuffer(GLint src_x0, GLint src_y0, GLint src_x1, G
     }
 #endif
     GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+}
+
+// Makes the call with a scissor box that no pixel passes, so that GL checks all of it (filter, mask, rectangles, the
+// framebuffers' completeness, formats and samples) without blitting anything. An error it generates stays for the page.
+bool OpenGLContext::blit_framebuffer_would_succeed(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter)
+{
+#ifdef ENABLE_WEBGL
+    // The page's earlier errors come first.
+    take_errors_from_gl();
+
+    GLboolean scissor_test = glIsEnabled(GL_SCISSOR_TEST);
+    GLint scissor_box[4] {};
+    glGetIntegerv(GL_SCISSOR_BOX, scissor_box);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 0, 0);
+    GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+    glScissor(scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3]);
+    if (!scissor_test)
+        glDisable(GL_SCISSOR_TEST);
+
+    auto errors = m_impl->errors_taken_from_gl.size();
+    take_errors_from_gl();
+    return m_impl->errors_taken_from_gl.size() == errors;
+#else
+    (void)src_x0, (void)src_y0, (void)src_x1, (void)src_y1, (void)dst_x0, (void)dst_y0, (void)dst_x1, (void)dst_y1, (void)mask, (void)filter;
+    return true;
+#endif
+}
+
+void OpenGLContext::take_errors_from_gl()
+{
+#ifdef ENABLE_WEBGL
+    for (auto error = glGetError(); error != GL_NO_ERROR; error = glGetError()) {
+        if (!m_impl->errors_taken_from_gl.contains_slow(error))
+            m_impl->errors_taken_from_gl.append(error);
+    }
+#endif
+}
+
+GLenum OpenGLContext::get_error()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->errors_taken_from_gl.is_empty())
+        return m_impl->errors_taken_from_gl.take_first();
+#endif
+    return GLFunctions::get_error();
 }
 
 // Picks a depth-only format for a format with stencil, or returns the format as it is.
