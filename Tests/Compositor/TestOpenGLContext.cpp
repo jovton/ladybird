@@ -231,12 +231,12 @@ TEST_CASE(impossible_mip_level_counts_are_rejected_quickly)
     auto start = MonotonicTime::now();
     glBindTexture(GL_TEXTURE_2D, textures[0]);
     context->tex_storage2d(GL_TEXTURE_2D, 0x7fffffff, GL_DEPTH24_STENCIL8, 8, 8);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     glBindTexture(GL_TEXTURE_CUBE_MAP, textures[1]);
     context->tex_storage2d(GL_TEXTURE_CUBE_MAP, 0x7fffffff, GL_RGBA8, 8, 8);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0x7fffffff, GL_DEPTH24_STENCIL8, 1, 1, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     EXPECT((MonotonicTime::now() - start) < AK::Duration::from_seconds(1));
     context->delete_textures(2, textures);
 }
@@ -334,7 +334,7 @@ TEST_CASE(depth_stencil_data_keeps_its_depth)
     }
     glBindTexture(GL_TEXTURE_2D, textures[0]);
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, texels24.size() * 4, texels24.data());
-    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     EXPECT_EQ(columns_in_front_of_stored_depth(*context, textures[0]), "....xxxx"sv);
 
     // FLOAT_32_UNSIGNED_INT_24_8_REV, laid out with a longer row length and skipped pixels and rows, which the depths get
@@ -355,7 +355,7 @@ TEST_CASE(depth_stencil_data_keeps_its_depth)
     glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
     glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH32F_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, texels32f.size() * 4, texels32f.data());
-    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     GLint row_length_after = 0;
     glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length_after);
     EXPECT_EQ(row_length_after, row_length);
@@ -368,7 +368,7 @@ TEST_CASE(depth_stencil_data_keeps_its_depth)
     glBindTexture(GL_TEXTURE_2D, textures[2]);
     context->tex_storage2d(GL_TEXTURE_2D, 1, GL_DEPTH24_STENCIL8, 8, 8);
     context->tex_sub_image2d_robust_angle(GL_TEXTURE_2D, 0, 0, 0, 8, 8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, texels24.size() * 4, texels24.data());
-    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     EXPECT_EQ(columns_in_front_of_stored_depth(*context, textures[2]), "....xxxx"sv);
 
     context->delete_textures(3, textures);
@@ -419,7 +419,7 @@ TEST_CASE(stencil_substitutions_are_not_remembered_wrongly)
     GLint max_size = 0;
     glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_size);
     context->renderbuffer_storage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, max_size + 1, 8);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, reused);
     EXPECT_EQ(attachment_type(GL_DEPTH_ATTACHMENT), GL_RENDERBUFFER);
     context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
@@ -432,7 +432,7 @@ TEST_CASE(stencil_substitutions_are_not_remembered_wrongly)
     glBindTexture(GL_TEXTURE_2D, texture);
     context->tex_storage2d(GL_TEXTURE_2D, 1, GL_DEPTH24_STENCIL8, 8, 8);
     context->tex_storage2d(GL_TEXTURE_2D, 1, GL_RGBA8, 8, 8);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     context->framebuffer_texture2d(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, texture, 0);
     EXPECT_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
 
@@ -462,13 +462,13 @@ TEST_CASE(huge_depth_stencil_uploads_are_rejected_safely)
     // Offsets and the repacked size wrap around to 0 in 64 bits.
     glBindTexture(GL_TEXTURE_2D_ARRAY, textures[0]);
     context->tex_image3d_robust_angle(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH32F_STENCIL8, 1 << 30, 1 << 30, 4, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, sizeof(data), data);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
 
     // A row length far longer than the data.
     glBindTexture(GL_TEXTURE_2D, textures[1]);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0x7fffffff);
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH32F_STENCIL8, 2, 2, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, sizeof(data), data);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
     // Rows and images that overlap: the data ends after 48 MiB, but its 2^63 texels would repack into 0 bytes.
@@ -479,7 +479,7 @@ TEST_CASE(huge_depth_stencil_uploads_are_rejected_safely)
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 1);
     glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 1);
     context->tex_image3d_robust_angle(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH32F_STENCIL8, overlapping_size, overlapping_size, overlapping_size, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, overlapping_data.size(), overlapping_data.data());
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
 
@@ -504,11 +504,11 @@ TEST_CASE(depth_stencil_data_for_other_internal_formats_is_rejected)
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_RGBA8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
-    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_INVALID_OPERATION));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_INVALID_OPERATION));
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0, nullptr);
-    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_INVALID_OPERATION));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_INVALID_OPERATION));
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
-    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     context->delete_textures(1, &texture);
 }
 
@@ -565,6 +565,13 @@ TEST_CASE(invalid_blits_from_antialiased_drawing_buffers_change_nothing)
     EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     EXPECT(!blitted_color());
 
+    // The same error, while the page hasn't taken the first one yet.
+    context->blit_framebuffer(0, 0, 8, 8, 0, 0, 8, 8, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_LINEAR);
+    context->blit_framebuffer(0, 0, 8, 8, 0, 0, 8, 8, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_LINEAR);
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_INVALID_OPERATION));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT(!blitted_color());
+
     context->blit_framebuffer(0, 0, 8, 8, 0, 0, 8, 8, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
     EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     EXPECT(blitted_color());
@@ -597,7 +604,12 @@ TEST_CASE(rejected_allocations_keep_depth_only_images_attachable)
     glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
     context->renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 8, 8);
     context->renderbuffer_storage(GL_RENDERBUFFER, 0x1234, 8, 8);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    // A wrong target, with what the renderbuffer already got on d3d12.
+    context->renderbuffer_storage(0x1234, GL_DEPTH_COMPONENT24, 8, 8);
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    context->renderbuffer_storage_multisample(0x1234, 0, GL_DEPTH_COMPONENT24, 8, 8);
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, renderbuffer);
     EXPECT_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
     context->framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
@@ -608,7 +620,10 @@ TEST_CASE(rejected_allocations_keep_depth_only_images_attachable)
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
     // RGBA8 can't be uploaded from floats, so GL rejects this, though its size is fine.
     context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_RGBA8, 8, 8, 0, GL_RGBA, GL_FLOAT, 0, nullptr);
-    EXPECT_NE(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    // An unsized format with depth-stencil data, which GL rejects too.
+    context->tex_image2d_robust_angle(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0, nullptr);
+    EXPECT_NE(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
     context->framebuffer_texture2d(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, texture, 0);
     EXPECT_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
 
