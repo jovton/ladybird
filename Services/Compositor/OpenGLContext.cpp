@@ -82,8 +82,6 @@ struct OpenGLContext::Impl {
     bool readback_pending { false };
 
     Optional<bool> uses_mesa_d3d12 {};
-    // From ANGLE_get_tex_level_parameter, which the stencil workarounds use on d3d12 to see what a texture image got.
-    PFNGLGETTEXLEVELPARAMETERIVANGLEPROC get_tex_level_parameteriv { nullptr };
 
     // Renderbuffers that the page gave a stencil format, but that got a depth-only one instead, see renderbuffer_storage().
     HashMap<GLuint, GLenum> renderbuffers_without_stencil {};
@@ -896,37 +894,12 @@ bool OpenGLContext::drawing_buffer_can_have_stencil()
 #endif
 }
 
-// OpenGL ES 3.0 can't say what format a texture image got, which the stencil workarounds need to know after
-// texImage2D() and texImage3D(), see texture_image_is(). ANGLE can, once asked to.
-void OpenGLContext::enable_texture_level_queries()
-{
-#ifdef ENABLE_WEBGL
-    auto lists = [](GLenum name) {
-        auto const* extensions = reinterpret_cast<char const*>(glGetString(name));
-        return extensions && StringView { extensions, strlen(extensions) }.split_view(' ').contains_slow("GL_ANGLE_get_tex_level_parameter"sv);
-    };
-    if (!lists(GL_EXTENSIONS)) {
-        if (!lists(GL_REQUESTABLE_EXTENSIONS_ANGLE))
-            return;
-        auto request_extension = reinterpret_cast<PFNGLREQUESTEXTENSIONANGLEPROC>(eglGetProcAddress("glRequestExtensionANGLE"));
-        if (!request_extension)
-            return;
-        request_extension("GL_ANGLE_get_tex_level_parameter");
-        if (!lists(GL_EXTENSIONS))
-            return;
-    }
-    m_impl->get_tex_level_parameteriv = reinterpret_cast<PFNGLGETTEXLEVELPARAMETERIVANGLEPROC>(eglGetProcAddress("glGetTexLevelParameterivANGLE"));
-#endif
-}
-
 bool OpenGLContext::uses_mesa_d3d12()
 {
 #ifdef ENABLE_WEBGL
     if (!m_impl->uses_mesa_d3d12.has_value()) {
         auto const* renderer = reinterpret_cast<char const*>(glGetString(GL_RENDERER));
         m_impl->uses_mesa_d3d12 = renderer && StringView { renderer, strlen(renderer) }.contains("D3D12"sv);
-        if (*m_impl->uses_mesa_d3d12)
-            enable_texture_level_queries();
     }
     return *m_impl->uses_mesa_d3d12;
 #else
@@ -984,23 +957,26 @@ bool OpenGLContext::blit_framebuffer_would_succeed(GLint src_x0, GLint src_y0, G
     if (!scissor_test)
         glDisable(GL_SCISSOR_TEST);
 
-    auto errors = m_impl->errors_taken_from_gl.size();
-    take_errors_from_gl();
-    return m_impl->errors_taken_from_gl.size() == errors;
+    return take_errors_from_gl() == 0;
 #else
     (void)src_x0, (void)src_y0, (void)src_x1, (void)src_y1, (void)dst_x0, (void)dst_y0, (void)dst_x1, (void)dst_y1, (void)mask, (void)filter;
     return true;
 #endif
 }
 
-void OpenGLContext::take_errors_from_gl()
+// Takes GL's errors, keeping them for get_error(), and returns how many there were. Like GL, this keeps each error once.
+// Taking the page's errors before one of its calls, and the call's own after it, tells whether GL accepted the call.
+size_t OpenGLContext::take_errors_from_gl()
 {
+    size_t count = 0;
 #ifdef ENABLE_WEBGL
     for (auto error = glGetError(); error != GL_NO_ERROR; error = glGetError()) {
+        ++count;
         if (!m_impl->errors_taken_from_gl.contains_slow(error))
             m_impl->errors_taken_from_gl.append(error);
     }
 #endif
+    return count;
 }
 
 GLenum OpenGLContext::get_error()
@@ -1040,75 +1016,49 @@ GLenum OpenGLContext::renderbuffer_format_for(GLenum format)
 }
 
 // Records the format substitution of the bound renderbuffer, once GL has allocated its storage. GL can reject the
-// allocation, keeping the renderbuffer as it was, so this goes by what the renderbuffer actually got. That can't use
-// glGetError(), which would take the error from the page.
-void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum format, GLsizei width, GLsizei height, bool within_limits)
+// allocation, keeping the renderbuffer as it was, which only its error tells apart: a renderbuffer can already have the
+// size and format that the rejected call asked for.
+void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum format)
 {
 #ifdef ENABLE_WEBGL
-    if (!uses_mesa_d3d12())
-        return;
     GLint renderbuffer = 0;
-    GLint allocated_format = GL_NONE;
-    GLint allocated_width = 0;
-    GLint allocated_height = 0;
     glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
     if (!renderbuffer)
         return;
-    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_INTERNAL_FORMAT, &allocated_format);
-    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &allocated_width);
-    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &allocated_height);
-    // The renderbuffer must have exactly the format it was given. Every format a page can give a renderbuffer is sized
-    // (DEPTH_STENCIL always gets substituted), so GL reports it as it is. Failing the same way, but with storage that
-    // already matched, looks the same afterwards, so the allocation must also have been within GL's limits.
-    bool substituted = format != requested_format;
-    bool allocated = within_limits && allocated_width == width && allocated_height == height && static_cast<GLenum>(allocated_format) == format;
-    if (!allocated)
-        return;
-    if (substituted)
+    if (format != requested_format)
         m_impl->renderbuffers_without_stencil.set(static_cast<GLuint>(renderbuffer), requested_format);
     else
         m_impl->renderbuffers_without_stencil.remove(static_cast<GLuint>(renderbuffer));
 #else
     (void)requested_format;
     (void)format;
-    (void)width;
-    (void)height;
 #endif
 }
 
 void OpenGLContext::renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    if (!uses_mesa_d3d12()) {
+        GLFunctions::renderbuffer_storage(target, internalformat, width, height);
+        return;
+    }
     auto format = renderbuffer_format_for(internalformat);
-    bool within_limits = renderbuffer_storage_is_within_limits(0, width, height);
+    take_errors_from_gl();
     GLFunctions::renderbuffer_storage(target, format, width, height);
-    note_renderbuffer_storage(internalformat, format, width, height, within_limits);
+    if (take_errors_from_gl() == 0)
+        note_renderbuffer_storage(internalformat, format);
 }
 
 void OpenGLContext::renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    if (!uses_mesa_d3d12()) {
+        GLFunctions::renderbuffer_storage_multisample(target, samples, internalformat, width, height);
+        return;
+    }
     auto format = renderbuffer_format_for(internalformat);
-    bool within_limits = renderbuffer_storage_is_within_limits(samples, width, height);
+    take_errors_from_gl();
     GLFunctions::renderbuffer_storage_multisample(target, samples, format, width, height);
-    note_renderbuffer_storage(internalformat, format, width, height, within_limits);
-}
-
-bool OpenGLContext::renderbuffer_storage_is_within_limits(GLsizei samples, GLsizei width, GLsizei height)
-{
-#ifdef ENABLE_WEBGL
-    if (!uses_mesa_d3d12())
-        return false;
-    GLint max_size = 0;
-    glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_size);
-    GLint max_samples = 0;
-    if (samples > 0)
-        glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
-    return width >= 0 && height >= 0 && width <= max_size && height <= max_size && samples >= 0 && samples <= max_samples;
-#else
-    (void)samples;
-    (void)width;
-    (void)height;
-    return false;
-#endif
+    if (take_errors_from_gl() == 0)
+        note_renderbuffer_storage(internalformat, format);
 }
 
 void OpenGLContext::delete_renderbuffers(GLsizei n, GLuint const* renderbuffers)
@@ -1416,14 +1366,13 @@ void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint i
 {
 #ifdef ENABLE_WEBGL
     if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0 && level <= max_mip_level) {
-        auto requested_internalformat = internalformat;
         auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, 1, buf_size, pixels, false);
-        bool can_succeed = tex_image_can_succeed(target, width, height, 1, border);
+        take_errors_from_gl();
         {
             UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
             GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
         }
-        if (can_succeed && texture_image_is(target, level, upload.has_value() ? GL_NONE : requested_internalformat, width, height, 1))
+        if (take_errors_from_gl() == 0)
             note_texture_stencil(target, level, 1, upload.has_value());
         return;
     }
@@ -1435,98 +1384,18 @@ void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint i
 {
 #ifdef ENABLE_WEBGL
     if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0 && level <= max_mip_level) {
-        auto requested_internalformat = internalformat;
         auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, depth, buf_size, pixels, true);
-        bool can_succeed = tex_image_can_succeed(target, width, height, depth, border);
+        take_errors_from_gl();
         {
             UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
             GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
         }
-        if (can_succeed && texture_image_is(target, level, upload.has_value() ? GL_NONE : requested_internalformat, width, height, depth))
+        if (take_errors_from_gl() == 0)
             note_texture_stencil(target, level, 1, upload.has_value());
         return;
     }
 #endif
     GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
-}
-
-// Whether the texture image at target and level now is what texImage2D()/texImage3D() asked for, i.e. whether GL accepted
-// the call. For a depth-stencil request that got a depth-only format (internalformat GL_NONE), that means some depth-only
-// format; for a sized format, exactly that one. Unsized formats (like GL_RGBA) are reported sized, so only their size is
-// compared. Without ANGLE_get_tex_level_parameter, this can't be told, and tex_image_can_succeed() has to do.
-// The texture level parameters ANGLE_get_tex_level_parameter answers, from OpenGL ES 3.1.
-static constexpr GLenum texture_width_parameter = 0x1000;          // GL_TEXTURE_WIDTH
-static constexpr GLenum texture_height_parameter = 0x1001;         // GL_TEXTURE_HEIGHT
-static constexpr GLenum texture_internal_format_parameter = 0x1003; // GL_TEXTURE_INTERNAL_FORMAT
-static constexpr GLenum texture_depth_parameter = 0x8071;          // GL_TEXTURE_DEPTH
-
-static bool is_unsized_format(GLint format)
-{
-    switch (format) {
-    case GL_RGB:
-    case GL_RGBA:
-    case GL_LUMINANCE:
-    case GL_LUMINANCE_ALPHA:
-    case GL_ALPHA:
-    case GL_DEPTH_COMPONENT:
-    case GL_DEPTH_STENCIL_OES:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool OpenGLContext::texture_image_is(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth)
-{
-#ifdef ENABLE_WEBGL
-    auto get = m_impl->get_tex_level_parameteriv;
-    if (!get)
-        return true;
-    GLint actual_format = GL_NONE, actual_width = 0, actual_height = 0, actual_depth = 1;
-    get(target, level, texture_internal_format_parameter, &actual_format);
-    get(target, level, texture_width_parameter, &actual_width);
-    get(target, level, texture_height_parameter, &actual_height);
-    if (target == GL_TEXTURE_2D_ARRAY)
-        get(target, level, texture_depth_parameter, &actual_depth);
-    if (actual_width != width || actual_height != height || actual_depth != depth)
-        return false;
-    if (internalformat == GL_NONE)
-        return actual_format == GL_DEPTH_COMPONENT16 || actual_format == GL_DEPTH_COMPONENT24 || actual_format == GL_DEPTH_COMPONENT32F;
-    return is_unsized_format(internalformat) || actual_format == internalformat;
-#else
-    (void)target;
-    (void)level;
-    (void)internalformat;
-    (void)width;
-    (void)height;
-    (void)depth;
-    return false;
-#endif
-}
-
-// texImage2D()/texImage3D() leave the texture as it was when GL rejects them, so their substitution must only be recorded
-// when they can succeed. There's no way to ask GL afterwards (OpenGL ES 3.0 can't query a texture level's format), and
-// glGetError() would take the error from the page, so this rules out what GL is sure to reject.
-bool OpenGLContext::tex_image_can_succeed(GLenum target, GLsizei width, GLsizei height, GLsizei depth, GLint border)
-{
-    if (border != 0 || width < 0 || height < 0 || depth < 0)
-        return false;
-    if (m_webgl_version == WebGLVersion::WebGL2 && immutable_levels_of_bound_texture(target).has_value())
-        return false;
-    bool is_cube_map_face = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
-    if (is_cube_map_face && width != height)
-        return false;
-    GLint max_size = 0;
-    glGetIntegerv(is_cube_map_face ? GL_MAX_CUBE_MAP_TEXTURE_SIZE : GL_MAX_TEXTURE_SIZE, &max_size);
-    if (width > max_size || height > max_size)
-        return false;
-    if (target == GL_TEXTURE_2D_ARRAY) {
-        GLint max_layers = 0;
-        glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &max_layers);
-        if (depth > max_layers)
-            return false;
-    }
-    return true;
 }
 
 // Whether the image at the given level of the texture bound to target got a depth-only format, see note_texture_stencil().
