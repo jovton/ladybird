@@ -759,7 +759,9 @@ bool OpenGLContext::allocate_msaa_drawing_buffer(bool stencil)
         m_impl->msaa_works = complete && glGetError() == GL_NO_ERROR;
     }
 
-    if (!*m_impl->msaa_works) {
+    // Even where it works, a later allocation can fail, as pages can make the drawing buffer as large as GL allows and
+    // GPU memory can run out. The drawing buffer then just isn't antialiased, rather than taking the Compositor down.
+    if (!*m_impl->msaa_works || glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         glDeleteFramebuffers(1, &m_impl->msaa_framebuffer);
         glDeleteRenderbuffers(1, &m_impl->msaa_color_buffer);
         if (m_impl->depth_buffer)
@@ -771,7 +773,6 @@ bool OpenGLContext::allocate_msaa_drawing_buffer(bool stencil)
         return false;
     }
 
-    VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
     return true;
 #else
     (void)stencil;
