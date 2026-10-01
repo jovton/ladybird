@@ -116,6 +116,7 @@ private:
     bool reads_antialiased_drawing_buffer();
     bool blit_framebuffer_would_succeed(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter);
     size_t take_errors_from_gl();
+    void keep_error(GLenum);
     bool uses_mesa_d3d12();
     bool read_framebuffer_has_unresolvable_depth();
     GLenum renderbuffer_format_for(GLenum);
