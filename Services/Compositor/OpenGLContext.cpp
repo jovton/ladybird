@@ -1179,7 +1179,8 @@ static constexpr GLint max_mip_level = 31;
 
 // A depth-stencil upload, turned into a depth-only one by drop_stencil_from_upload().
 struct DepthOnlyUpload {
-    // Set when the data had to be repacked. It's tightly packed, unlike the page's data, see UnpackStateOverride.
+    // Set when the data had to be repacked. It's tightly packed, unlike the page's data, see UnpackStateOverride. Small
+    // data lives inside the ByteBuffer, so the upload must use it where it ends up, see use_repacked_data().
     ByteBuffer repacked;
     // Set when the data couldn't be repacked. The upload must then not reach GL at all, see drop_stencil_from_upload().
     GLenum error { GL_NO_ERROR };
@@ -1276,7 +1277,7 @@ static ErrorOr<ByteBuffer, GLenum> repack_depths(GLenum type, GLsizei width, GLs
 // other formats, otherwise the data gets repacked, see repack_depths(). Returns nothing if the upload isn't depth-stencil,
 // which leaves it to GL unchanged. Once it is, the original upload must not reach GL, as GL would then allocate the
 // stencil this exists to avoid: if the data can't be repacked, the result has the error the upload gets instead.
-static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat, GLenum& format, GLenum& type, GLsizei width, GLsizei height, GLsizei depth, GLsizei& buf_size, void const*& pixels, bool is_3d)
+static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat, GLenum& format, GLenum& type, GLsizei width, GLsizei height, GLsizei depth, GLsizei buf_size, void const* pixels, bool is_3d)
 {
     if (format != GL_DEPTH_STENCIL_OES || width < 0 || height < 0 || depth < 0)
         return {};
@@ -1301,8 +1302,6 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
             return upload;
         }
         upload.repacked = repacked.release_value();
-        pixels = upload.repacked.data();
-        buf_size = static_cast<GLsizei>(upload.repacked.size());
     }
     if (type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) {
         if (internalformat)
@@ -1315,6 +1314,15 @@ static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat,
     }
     format = GL_DEPTH_COMPONENT;
     return upload;
+}
+
+// Makes an upload use its repacked data, if it has any.
+static void use_repacked_data(Optional<DepthOnlyUpload> const& upload, GLsizei& buf_size, void const*& pixels)
+{
+    if (!upload.has_value() || upload->repacked.is_empty())
+        return;
+    pixels = upload->repacked.data();
+    buf_size = static_cast<GLsizei>(upload->repacked.size());
 }
 
 // Sets tightly packed unpack state for uploading repacked data, and puts the page's back afterwards.
@@ -1431,6 +1439,7 @@ void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint i
             return;
         }
         {
+            use_repacked_data(upload, buf_size, pixels);
             UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
             GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
         }
@@ -1453,6 +1462,7 @@ void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint i
             return;
         }
         {
+            use_repacked_data(upload, buf_size, pixels);
             UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
             GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
         }
@@ -1488,6 +1498,7 @@ void OpenGLContext::tex_sub_image2d_robust_angle(GLenum target, GLint level, GLi
         keep_error(upload->error);
         return;
     }
+    use_repacked_data(upload, buf_size, pixels);
     UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_sub_image2d_robust_angle(target, level, xoffset, yoffset, width, height, format, type, buf_size, pixels);
@@ -1504,6 +1515,7 @@ void OpenGLContext::tex_sub_image3d_robust_angle(GLenum target, GLint level, GLi
         keep_error(upload->error);
         return;
     }
+    use_repacked_data(upload, buf_size, pixels);
     UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
 #endif
     GLFunctions::tex_sub_image3d_robust_angle(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, buf_size, pixels);
