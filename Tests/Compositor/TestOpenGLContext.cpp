@@ -509,6 +509,67 @@ TEST_CASE(depth_stencil_data_for_other_internal_formats_is_rejected)
     context->delete_textures(1, &texture);
 }
 
+// Blitting color and depth from an antialiased drawing buffer takes two calls, but an invalid blit must not blit either.
+TEST_CASE(invalid_blits_from_antialiased_drawing_buffers_change_nothing)
+{
+    auto context = Compositor::OpenGLContext::create(nullptr, Compositor::OpenGLContext::WebGLVersion::WebGL2, { .depth = true, .stencil = false, .antialias = true });
+    if (!context) {
+        warnln("No EGL display available, skipping");
+        return;
+    }
+    context->set_size({ 8, 8 });
+    context->make_current();
+    shut_down_egl_at_exit(eglGetCurrentDisplay());
+    context->allocate_painting_surface_if_needed();
+    if (!context->drawing_buffer_has_antialias()) {
+        warnln("No antialiased drawing buffer, skipping");
+        return;
+    }
+    while (glGetError() != GL_NO_ERROR) { }
+
+    GLuint framebuffer = 0;
+    GLuint renderbuffers[2] {};
+    glGenFramebuffers(1, &framebuffer);
+    glGenRenderbuffers(2, renderbuffers);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffers[0]);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 8, 8);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffers[0]);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffers[1]);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 8, 8);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, renderbuffers[1]);
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, context->default_framebuffer());
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
+
+    auto blitted_color = [&] {
+        u8 pixel[4] {};
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+        glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, context->default_framebuffer());
+        return pixel[0] == 255 && pixel[2] == 0;
+    };
+
+    // Depth can't be blitted with GL_LINEAR. The page's earlier error has to stay first.
+    glEnable(0x1234);
+    context->blit_framebuffer(0, 0, 8, 8, 0, 0, 8, 8, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_LINEAR);
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_INVALID_ENUM));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_INVALID_OPERATION));
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT(!blitted_color());
+
+    context->blit_framebuffer(0, 0, 8, 8, 0, 0, 8, 8, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    EXPECT_EQ(context->get_error(), static_cast<GLenum>(GL_NO_ERROR));
+    EXPECT(blitted_color());
+
+    glDeleteFramebuffers(1, &framebuffer);
+    glDeleteRenderbuffers(2, renderbuffers);
+}
+
 // A call GL rejects leaves a renderbuffer or texture image as it was, including a depth-only one that got its format
 // instead of a depth-stencil one on d3d12. It must stay attachable as depth-stencil, even when the rejected call had the
 // same size.
