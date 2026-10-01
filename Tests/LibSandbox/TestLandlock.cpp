@@ -154,6 +154,11 @@ static bool can_read(char const* path)
 
 TEST_CASE(fontconfig_configuration_is_readable_but_nothing_next_to_it)
 {
+    if (syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION) < 1) {
+        warnln("Skipping fontconfig confinement test: Landlock is required");
+        return;
+    }
+
     char directory_template[] = "/tmp/ladybird-landlock-fontconfig-XXXXXX";
     auto* directory = mkdtemp(directory_template);
     VERIFY(directory);
