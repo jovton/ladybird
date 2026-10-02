@@ -14,6 +14,8 @@ We currently use gcc-14 and clang-21 in our CI pipeline. If these versions are n
 
 CMake 3.30 or newer must be available in $PATH.
 
+On Linux, H.264 and AAC playback, and the media tests that use them, also need a system libavcodec from FFmpeg 7 or newer (libavcodec 61 to 63), such as `libavcodec61` on Debian 13. Ubuntu 24.04's `libavcodec60` is too old. It's only loaded at runtime, so the build doesn't need it.
+
 ---
 
 ### Debian/Ubuntu:

@@ -114,8 +114,10 @@ CanvasHost::CreateWebGLContextResult CanvasHost::create_webgl_context(Compositin
 
     auto canvas_id = m_canvas_surface_registry.allocate_canvas_id();
     auto supported_extensions = context->gl_context().get_supported_opengl_extensions();
+    auto has_stencil = context->gl_context().drawing_buffer_has_stencil();
+    auto has_antialias = context->gl_context().drawing_buffer_has_antialias();
     m_contexts.set(canvas_id, context.release_nonnull());
-    return { .success = true, .canvas_id = canvas_id, .supported_extensions = move(supported_extensions) };
+    return { .success = true, .canvas_id = canvas_id, .supported_extensions = move(supported_extensions), .stencil = has_stencil, .antialias = has_antialias };
 }
 
 void CanvasHost::destroy_context(Compositing::CanvasId canvas_id)
@@ -238,6 +240,14 @@ void CanvasHost::present_webgl_canvas(Compositing::CanvasId canvas_id, bool pres
 
     auto surface = MUST(as_webgl(*context).prepare_for_compositing(preserve_drawing_buffer));
     m_canvas_surface_registry.set_canvas_surface(canvas_id, move(surface));
+
+    // The frame's pixels only reach the surface once something looks it up, so the GPU can make the copy in the meantime.
+    m_canvas_surface_registry.set_pending_content_resolver(canvas_id, [this, canvas_id] {
+        if (auto* context = this->context(canvas_id)) {
+            if (auto* webgl_context = context->get_pointer<WebGLContext>())
+                (*webgl_context)->finish_pending_present();
+        }
+    });
 }
 
 void CanvasHost::clear_webgl_drawing_buffer(Compositing::CanvasId canvas_id)
@@ -275,6 +285,8 @@ RefPtr<Gfx::PaintingSurface> CanvasHost::presented_surface(Compositing::CanvasId
             return canvas_context.presented_surface;
         },
         [](WebGLContext& webgl_context) -> RefPtr<Gfx::PaintingSurface> {
+            // The presented frame may still be on its way back from the GPU.
+            webgl_context->finish_pending_present();
             return webgl_context->surface();
         });
 }

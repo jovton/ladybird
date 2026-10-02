@@ -83,6 +83,39 @@ ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringVie
     TRY(paths.try_append({ move(path_bytes), access, is_directory }));
     return {};
 }
+
+ErrorOr<void> add_fontconfig_configuration_paths(Vector<LandlockPath>& paths)
+{
+    auto environment = [](char const* name) -> Optional<StringView> {
+        auto const* value = getenv(name);
+        if (!value || !*value)
+            return {};
+        return StringView { value, strlen(value) };
+    };
+    auto add = [&](StringView path) { return add_landlock_path_if_exists(paths, path, LandlockPath::Access::ReadOnly); };
+
+    // The files in conf.d are usually symlinks into /usr/share/fontconfig/conf.avail.
+    TRY(add("/etc/fonts"sv));
+    TRY(add("/usr/share/fontconfig"sv));
+    TRY(add("/usr/local/etc/fonts"sv));
+
+    if (auto config_home = environment("XDG_CONFIG_HOME"); config_home.has_value())
+        TRY(add(LexicalPath::join(*config_home, "fontconfig"sv).string()));
+    if (auto home = environment("HOME"); home.has_value()) {
+        TRY(add(LexicalPath::join(*home, ".config/fontconfig"sv).string()));
+        // Locations fontconfig still reads for compatibility.
+        TRY(add(LexicalPath::join(*home, ".fonts.conf"sv).string()));
+        TRY(add(LexicalPath::join(*home, ".fonts.conf.d"sv).string()));
+    }
+
+    if (auto file = environment("FONTCONFIG_FILE"); file.has_value())
+        TRY(add(*file));
+    if (auto path = environment("FONTCONFIG_PATH"); path.has_value()) {
+        for (auto directory : path->split_view(':'))
+            TRY(add(directory));
+    }
+    return {};
+}
 #endif
 
 #if defined(AK_OS_MACOS)

@@ -4,10 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteString.h>
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 #include <LibTest/TestCase.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
@@ -19,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -138,6 +141,72 @@ TEST_CASE(a_process_with_a_second_thread_refuses_the_sandbox)
     VERIFY(waitpid(child, &status, 0) == child);
     VERIFY(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+static bool can_read(char const* path)
+{
+    auto fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    close(fd);
+    return true;
+}
+
+TEST_CASE(fontconfig_configuration_is_readable_but_nothing_next_to_it)
+{
+    if (syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION) < 1) {
+        warnln("Skipping fontconfig confinement test: Landlock is required");
+        return;
+    }
+
+    char directory_template[] = "/tmp/ladybird-landlock-fontconfig-XXXXXX";
+    auto* directory = mkdtemp(directory_template);
+    VERIFY(directory);
+    auto home = ByteString::formatted("{}/home", directory);
+    auto fontconfig_directory = ByteString::formatted("{}/.config/fontconfig", home);
+    auto configuration = ByteString::formatted("{}/fonts.conf", fontconfig_directory);
+    auto elsewhere = ByteString::formatted("{}/elsewhere", home);
+    for (auto const& path : { home, ByteString::formatted("{}/.config", home), fontconfig_directory })
+        VERIFY(mkdir(path.characters(), 0700) == 0);
+    for (auto const& path : { configuration, elsewhere }) {
+        auto fd = open(path.characters(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+        VERIFY(fd >= 0);
+        close(fd);
+    }
+
+    auto child = fork();
+    VERIFY(child >= 0);
+    if (child == 0) {
+        setenv("HOME", home.characters(), 1);
+        unsetenv("XDG_CONFIG_HOME");
+        unsetenv("FONTCONFIG_FILE");
+        unsetenv("FONTCONFIG_PATH");
+
+        Vector<Sandbox::LandlockPath> paths;
+        MUST(Sandbox::add_fontconfig_configuration_paths(paths));
+        MUST(Sandbox::install_no_new_privileges());
+        MUST(Sandbox::restrict_filesystem_with_landlock(paths.span()));
+
+        if (!can_read(configuration.characters()))
+            _exit(1);
+        if (can_read(elsewhere.characters()))
+            _exit(2);
+        struct stat system_configuration;
+        if (stat("/etc/fonts/fonts.conf", &system_configuration) == 0 && !can_read("/etc/fonts/fonts.conf"))
+            _exit(3);
+        _exit(0);
+    }
+
+    int status = 0;
+    VERIFY(waitpid(child, &status, 0) == child);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    for (auto const& path : { configuration, elsewhere })
+        VERIFY(unlink(path.characters()) == 0);
+    for (auto const& path : { fontconfig_directory, ByteString::formatted("{}/.config", home), home, ByteString { directory } })
+        VERIFY(rmdir(path.characters()) == 0);
 }
 
 #ifdef LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
