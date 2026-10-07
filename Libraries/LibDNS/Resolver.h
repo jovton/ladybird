@@ -924,13 +924,19 @@ private:
         if (!got_records_this_side)
             return;
 
-        // First side has records. Wait briefly so the other side gets a chance to add its records too
-        // (RFC 8305 Resolution Delay, 50 ms).
+        // First side has records. Wait so the other side gets a chance to add its records too. When the A records
+        // come first, this is RFC 8305's Resolution Delay of 50 ms. When the AAAA records come first, RFC 8305 starts
+        // the first IPv6 connection attempt right away, as one attempt among several, but curl only ever sees the
+        // addresses we hand it up front. So wait for the A records, which are what makes a host reachable without
+        // IPv6 connectivity (a request with only AAAA records fails at once there), up to a bound for a stalled stub
+        // resolver.
         if (state.grace_timer)
             return;
         constexpr int RESOLUTION_DELAY_MS = 50;
+        constexpr int A_RECORDS_DELAY_MS = 1000;
+        auto delay_ms = family == Core::Socket::AddressFamily::IPv6Only ? A_RECORDS_DELAY_MS : RESOLUTION_DELAY_MS;
         auto weak_state = state.make_weak_ptr();
-        state.grace_timer = Core::Timer::create_single_shot(RESOLUTION_DELAY_MS, [weak_state] {
+        state.grace_timer = Core::Timer::create_single_shot(delay_ms, [weak_state] {
             if (auto state = weak_state.strong_ref())
                 try_finalize_pending_system_resolution(*state);
         });
