@@ -98,21 +98,34 @@ Optional<RemoteWebGLContext> create_remote_webgl_context(HTML::CanvasHost& canva
 
 }
 
-OwnPtr<WebGLContextProxy> create_webgl_context_proxy(HTML::CanvasHost& canvas, WebGLVersion webgl_version, WebGLContextAttributes const& context_attributes)
+// The actual context parameters are the requested ones, except for what the drawing buffer couldn't get: with Mesa's
+// d3d12 driver, it has no stencil buffer, see OpenGLContext::drawing_buffer_can_have_stencil(), and only WebGL 2
+// contexts are antialiased, see OpenGLContext::drawing_buffer_can_have_antialias().
+static WebGLContextAttributes actual_context_attributes(WebGLContextAttributes const& requested, RemoteWebGLTransport::CreateResult const& result)
+{
+    auto actual = requested;
+    actual.stencil = result.stencil;
+    actual.antialias = result.antialias;
+    return actual;
+}
+
+OwnPtr<WebGLContextProxy> create_webgl_context_proxy(HTML::CanvasHost& canvas, WebGLVersion webgl_version, WebGLContextAttributes const& context_attributes, WebGLContextAttributes& actual)
 {
     auto remote = create_remote_webgl_context(canvas, webgl_version, context_attributes);
     if (!remote.has_value())
         return {};
 
+    actual = actual_context_attributes(context_attributes, remote->result);
     return make<WebGLContextProxy>(move(remote->transport), webgl_version, move(remote->result.supported_extensions));
 }
 
-bool restore_webgl_context_proxy(WebGLContextProxy& context, HTML::CanvasHost& canvas, WebGLVersion webgl_version, WebGLContextAttributes const& context_attributes)
+bool restore_webgl_context_proxy(WebGLContextProxy& context, HTML::CanvasHost& canvas, WebGLVersion webgl_version, WebGLContextAttributes const& context_attributes, WebGLContextAttributes& actual)
 {
     auto remote = create_remote_webgl_context(canvas, webgl_version, context_attributes);
     if (!remote.has_value())
         return false;
 
+    actual = actual_context_attributes(context_attributes, remote->result);
     context.restore(move(remote->transport), move(remote->result.supported_extensions));
     return true;
 }
@@ -122,13 +135,14 @@ JS::ThrowCompletionOr<GC::Ptr<WebGLRenderingContext>> WebGLRenderingContext::cre
     // We should be coming here from getContext being called on a wrapped <canvas> element or OffscreenCanvas.
     auto context_attributes = TRY(convert_value_to_context_attributes_dictionary(realm.vm(), options));
 
-    auto context = create_webgl_context_proxy(canvas_host_for(canvas), WebGLVersion::WebGL1, context_attributes);
+    WebGLContextAttributes actual_context_attributes;
+    auto context = create_webgl_context_proxy(canvas_host_for(canvas), WebGLVersion::WebGL1, context_attributes, actual_context_attributes);
     if (!context) {
         fire_webgl_context_creation_error(canvas_host_for(canvas));
         return GC::Ptr<WebGLRenderingContext> { nullptr };
     }
 
-    return realm.create<WebGLRenderingContext>(realm, canvas, context.release_nonnull(), context_attributes, context_attributes);
+    return realm.create<WebGLRenderingContext>(realm, canvas, context.release_nonnull(), context_attributes, actual_context_attributes);
 }
 
 WebGLRenderingContext::WebGLRenderingContext(JS::Realm& realm, CanvasOwner canvas, NonnullOwnPtr<WebGLContextProxy> context, WebGLContextAttributes context_creation_parameters, WebGLContextAttributes actual_context_parameters)
@@ -155,7 +169,7 @@ void WebGLRenderingContext::prepare_for_compositing()
 
 bool WebGLRenderingContext::reestablish_remote_context()
 {
-    return restore_webgl_context_proxy(context(), canvas_host(), WebGLVersion::WebGL1, m_actual_context_parameters);
+    return restore_webgl_context_proxy(context(), canvas_host(), WebGLVersion::WebGL1, m_context_creation_parameters, m_actual_context_parameters);
 }
 
 CanvasOwner WebGLRenderingContext::canvas_for_binding() const

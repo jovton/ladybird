@@ -21,6 +21,8 @@ struct VulkanContext {
     VkQueue graphics_queue { VK_NULL_HANDLE };
     uint32_t graphics_queue_family { 0 };
 #    ifdef USE_VULKAN_DMABUF_IMAGES
+    // Whether images can be shared with other processes as DMA-BUFs. If not, ext_procs are null.
+    bool supports_dmabuf_images { false };
     VkCommandPool command_pool { VK_NULL_HANDLE };
     VkCommandBuffer command_buffer { VK_NULL_HANDLE };
     struct

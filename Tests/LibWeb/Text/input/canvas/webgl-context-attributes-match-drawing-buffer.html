@@ -1,0 +1,23 @@
+<!doctype html>
+<script src="../include.js"></script>
+<script>
+    // getContextAttributes() reports what the drawing buffer actually got, which isn't always what the page asked for:
+    // with Mesa's d3d12 driver it has no stencil buffer. So instead of expecting a particular value, this checks that
+    // the reported attributes match the bits the drawing buffer really has.
+    test(() => {
+        for (const version of ["webgl", "webgl2"]) {
+            for (const requested of [{ depth: true, stencil: true }, { depth: false, stencil: true }, { depth: true, stencil: false }]) {
+                const canvas = document.createElement("canvas");
+                const gl = canvas.getContext(version, requested);
+                const attributes = gl.getContextAttributes();
+                const hasStencil = gl.getParameter(gl.STENCIL_BITS) > 0;
+                const hasDepth = gl.getParameter(gl.DEPTH_BITS) > 0;
+                const label = `${version} depth=${requested.depth} stencil=${requested.stencil}`;
+                println(`${label}: stencil attribute matches the drawing buffer: ${attributes.stencil === hasStencil}`);
+                println(`${label}: depth attribute matches the drawing buffer: ${attributes.depth === hasDepth}`);
+                if (!requested.stencil)
+                    println(`${label}: no stencil reported when none was requested: ${attributes.stencil === false}`);
+            }
+        }
+    });
+</script>

@@ -18,12 +18,18 @@
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 #include <link.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace Compositor {
 
 // A driver or layer manifest names the library that the loader opens. A bare name is found by the dynamic loader in
-// the library directories, which are already allowed. A path, which may be relative to the manifest, can be anywhere.
+// the library directories, which are already allowed. A path, which may be relative to the manifest, can be anywhere,
+// and the library may load its own dependencies from next to it (e.g. a libEGL_mesa with RUNPATH $ORIGIN that needs a
+// matching libgallium), so its whole directory is allowed. Otherwise the dynamic loader would skip to the system's copy
+// of a dependency with the same name, or fail. Landlock goes by the file a path resolves to, so where the library is a
+// symlink to one elsewhere, that directory doesn't cover it: the library itself is allowed as well, and the directory
+// it really is in, along with the dependencies next to it (which the symlinks next to the link may point to).
 static ErrorOr<void> add_manifest_library_paths(Vector<Sandbox::LandlockPath>& paths, StringView manifest_path)
 {
     auto file = Core::File::open(manifest_path, Core::File::OpenMode::Read);
@@ -39,7 +45,14 @@ static ErrorOr<void> add_manifest_library_paths(Vector<Sandbox::LandlockPath>& p
         if (!library_path.has_value() || !library_path->contains('/'))
             return {};
         auto path = LexicalPath::absolute_path(LexicalPath::dirname(manifest_path), *library_path);
-        return Sandbox::add_landlock_path_if_exists(paths, path, Sandbox::LandlockPath::Access::ReadOnly);
+        TRY(Sandbox::add_landlock_path_if_exists(paths, path, Sandbox::LandlockPath::Access::ReadOnly));
+        TRY(Sandbox::add_landlock_path_if_exists(paths, LexicalPath::dirname(path), Sandbox::LandlockPath::Access::ReadOnly));
+        auto* resolved_path = realpath(path.characters(), nullptr);
+        if (!resolved_path)
+            return {};
+        auto resolved_directory = LexicalPath::dirname(ByteString { resolved_path });
+        free(resolved_path);
+        return Sandbox::add_landlock_path_if_exists(paths, resolved_directory, Sandbox::LandlockPath::Access::ReadOnly);
     };
 
     auto const& object = manifest.value().as_object();
@@ -157,6 +170,8 @@ ErrorOr<void> restrict_filesystem(StringView resource_root)
 
     Vector<Sandbox::LandlockPath> paths;
     TRY(Sandbox::add_landlock_path_if_exists(paths, TRY(String::formatted("{}/fonts", resource_root)), Sandbox::LandlockPath::Access::ReadOnly));
+    // Text is hinted the way fontconfig's configuration says, see Gfx::Font::hinting_options().
+    TRY(Sandbox::add_fontconfig_configuration_paths(paths));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/lib"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/lib64"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/lib"sv, Sandbox::LandlockPath::Access::ReadOnly));
@@ -171,6 +186,8 @@ ErrorOr<void> restrict_filesystem(StringView resource_root)
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/vulkan"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/dri"sv, Sandbox::LandlockPath::Access::ReadWrite));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/udmabuf"sv, Sandbox::LandlockPath::Access::ReadWrite));
+    // WSL's GPU interface, which Mesa's Direct3D 12 based drivers use.
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/dxg"sv, Sandbox::LandlockPath::Access::ReadWrite));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/sys"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/ld.so.cache"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/egl"sv, Sandbox::LandlockPath::Access::ReadOnly));
@@ -235,6 +252,8 @@ ErrorOr<void> apply_sandbox(StringView, StringView, StringView)
     policy.allow_ipc();
     policy.allow_socket_pairs();
     policy.allow_gpu_device_operations();
+    if (!Core::System::access("/dev/dxg"sv, F_OK).is_error())
+        policy.allow_wsl_gpu_device_operations();
     policy.allow_common_runtime();
     policy.allow_executable_memory_mappings();
     // Some GPU drivers allocate writable executable code heaps lazily after

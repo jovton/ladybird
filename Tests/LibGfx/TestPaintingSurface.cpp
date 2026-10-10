@@ -28,12 +28,20 @@ static int count_red_pixels(Gfx::Bitmap const& bitmap, Gfx::IntRect const& rect)
     return count;
 }
 
+// Every test shares one GPU backend. Intel's GPU driver on WSL2 aborts when a process creates a second Vulkan device
+// (its shader compiler registers its options again), and the browser itself only ever creates one per process.
+static RefPtr<Gfx::SkiaBackendContext> gpu_backend()
+{
+    static RefPtr<Gfx::SkiaBackendContext> s_context = Gfx::SkiaBackendContext::create_independent_gpu_backend();
+    return s_context;
+}
+
 TEST_CASE(stroke_then_blend_layer_on_gpu_surface)
 {
     // A stroked path selects multisampling on a GPU surface, and a layer that blends with its backdrop reads the
     // destination in the same surface. Both must survive in the same frame with a layer between them.
 
-    auto context = Gfx::SkiaBackendContext::create_independent_gpu_backend();
+    auto context = gpu_backend();
     if (!context) {
         warnln("No GPU backend available, skipping");
         return;
@@ -79,7 +87,7 @@ TEST_CASE(flush_surface_skia_allocated)
     auto cpu_surface = Gfx::PaintingSurface::create_with_size({ 1, 1 }, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied);
     EXPECT(!cpu_surface->wraps_shared_image());
 
-    auto context = Gfx::SkiaBackendContext::create_independent_gpu_backend();
+    auto context = gpu_backend();
     if (!context) {
         warnln("No GPU backend available, skipping");
         return;

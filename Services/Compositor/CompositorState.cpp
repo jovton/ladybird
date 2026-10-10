@@ -1163,6 +1163,11 @@ BackingStoreManager::GpuSharing CompositorState::gpu_sharing_for_client() const
     if (!m_skia_backend_context || m_client_gpu_presentation_adapter_luid != m_skia_backend_context->direct3d_context().adapter_luid())
         return BackingStoreManager::GpuSharing::Disallowed;
 #endif
+#ifdef USE_VULKAN_DMABUF_IMAGES
+    // Vulkan images can only be shared with the client as DMA-BUFs, which not every device supports.
+    if (!m_skia_backend_context || !m_skia_backend_context->vulkan_context().supports_dmabuf_images)
+        return BackingStoreManager::GpuSharing::Disallowed;
+#endif
     return BackingStoreManager::GpuSharing::Allowed;
 }
 

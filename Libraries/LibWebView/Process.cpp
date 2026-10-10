@@ -115,6 +115,7 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
     // Mesa and the Vulkan loader read these to select and configure the GPU driver.
     static constexpr Array gpu_prefixes {
         "DRI_PRIME"sv,
+        "GALLIUM_"sv,
         "MESA_"sv,
         "VK_"sv,
         "__EGL_"sv,
