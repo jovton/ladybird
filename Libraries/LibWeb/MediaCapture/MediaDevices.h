@@ -45,6 +45,8 @@ public:
     void set_ondevicechange(WebIDL::CallbackType* event_handler);
     WebIDL::CallbackType* ondevicechange();
 
+    void did_change_system_focus();
+
 private:
     struct StoredDevice final {
         Utf16String dom_device_id;

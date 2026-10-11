@@ -32,6 +32,7 @@
 #include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -40,6 +41,7 @@
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
+#include <LibWeb/MediaCapture/MediaDevices.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/PaintFacts.h>
@@ -565,6 +567,19 @@ void Page::handle_gamepad_disconnected(Gamepad::GamepadHandle handle)
 {
     for (auto const& root : local_roots())
         root->event_handler().handle_gamepad_disconnected(handle);
+}
+
+void Page::did_change_system_focus()
+{
+    for (auto const& navigable : hosted_navigables()) {
+        auto document = navigable->active_document();
+        if (!document || !document->window())
+            continue;
+        if (auto navigator = document->window()->navigator_if_exists()) {
+            if (auto media_devices = navigator->media_devices_if_exists())
+                media_devices->did_change_system_focus();
+        }
+    }
 }
 
 void Page::invalidate_compositor_keyboard_scroll_state()

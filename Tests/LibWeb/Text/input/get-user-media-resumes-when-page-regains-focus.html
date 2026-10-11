@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script>
+    promiseTest(async () => {
+        internals.setPageFocus(false);
+
+        let settled = false;
+        const request = navigator.mediaDevices.getUserMedia({ audio: true }).then(
+            () => "resolved",
+            error => error.name
+        ).finally(() => {
+            settled = true;
+        });
+
+        await timeout(100);
+        println(`Settled without page focus: ${settled}`);
+
+        internals.setPageFocus(true);
+        println(`Settled after the page regained focus: ${await request}`);
+    });
+</script>

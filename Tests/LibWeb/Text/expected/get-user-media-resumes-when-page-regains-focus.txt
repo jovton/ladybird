@@ -1,0 +1,2 @@
+Settled without page focus: false
+Settled after the page regained focus: NotFoundError

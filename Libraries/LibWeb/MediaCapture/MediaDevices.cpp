@@ -588,6 +588,14 @@ void MediaDevices::process_pending_enumerate_devices_requests()
         queue_enumerate_devices_task(request.promise);
 }
 
+// AD-HOC: Requests wait for system focus and are rechecked on the window's focus and blur events, but those only fire
+//         when focus moves within the page. The page's own system focus changes without them, so recheck here too.
+void MediaDevices::did_change_system_focus()
+{
+    process_pending_enumerate_devices_requests();
+    process_pending_get_user_media_requests();
+}
+
 void MediaDevices::process_pending_get_user_media_requests()
 {
     if (!get_user_media_can_proceed())
