@@ -28,6 +28,8 @@ ErrorOr<void> apply_sandbox(StringView)
     TRY(Sandbox::add_landlock_path_if_exists(paths, LexicalPath::join(build_root, "lib"sv).string(), Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_loaded_library_directories(paths, build_root));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/proc/self"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    // Text is hinted the way fontconfig's configuration says, see Gfx::Font::hinting_options().
+    TRY(Sandbox::add_fontconfig_configuration_paths(paths));
 
     TRY(Sandbox::restrict_filesystem_with_landlock(paths.span()));
 

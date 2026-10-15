@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullRefPtr.h>
@@ -44,10 +45,20 @@ public:
     {
         m_surfaces.remove(id);
         m_content_generations.remove(id);
+        m_pending_content_resolvers.remove(id);
+    }
+
+    // A surface can get its content only once it's needed, such as a WebGL drawing buffer that is still being read
+    // back from the GPU. The resolver then runs once, before anything looks up the surface.
+    void set_pending_content_resolver(CanvasId id, Function<void()> resolver)
+    {
+        m_pending_content_resolvers.set(id, move(resolver));
     }
 
     Gfx::PaintingSurface const* canvas_surface(CanvasId id) const
     {
+        if (auto resolver = m_pending_content_resolvers.take(id); resolver.has_value())
+            (*resolver)();
         return m_surfaces.get(id).value_or(nullptr);
     }
 
@@ -61,6 +72,7 @@ private:
     u64 m_last_content_generation { 0 };
     HashMap<CanvasId, NonnullRefPtr<Gfx::PaintingSurface>> m_surfaces;
     HashMap<CanvasId, u64> m_content_generations;
+    mutable HashMap<CanvasId, Function<void()>> m_pending_content_resolvers;
 };
 
 }

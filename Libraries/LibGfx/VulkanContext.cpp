@@ -80,7 +80,36 @@ static ErrorOr<VkPhysicalDevice> pick_physical_device(VkInstance instance)
     VERIFY_NOT_REACHED();
 }
 
-static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device, uint32_t* graphics_queue_family)
+#ifdef USE_VULKAN_DMABUF_IMAGES
+static constexpr Array<char const*, 4> dmabuf_device_extensions = {
+    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+    VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
+    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+};
+
+static bool device_supports_dmabuf_images(VkPhysicalDevice physical_device)
+{
+    uint32_t extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr);
+
+    Vector<VkExtensionProperties> extensions;
+    extensions.resize(extension_count);
+    vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, extensions.data());
+
+    bool supported = true;
+    for (auto const* extension_name : dmabuf_device_extensions) {
+        StringView name { extension_name, strlen(extension_name) };
+        if (!extensions.contains([&name](auto const& extension) { return extension.extensionName == name; })) {
+            dbgln("Vulkan device does not support {}, disabling DMA-BUF image sharing", name);
+            supported = false;
+        }
+    }
+    return supported;
+}
+#endif
+
+static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device, ReadonlySpan<char const*> device_extensions, uint32_t* graphics_queue_family)
 {
     VkDevice device;
 
@@ -114,16 +143,6 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device,
     queue_create_info.pQueuePriorities = &queue_priority;
 
     VkPhysicalDeviceFeatures deviceFeatures {};
-#ifdef USE_VULKAN_DMABUF_IMAGES
-    Array<char const*, 4> device_extensions = {
-        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
-        VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
-        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-    };
-#else
-    Array<char const*, 0> device_extensions;
-#endif
     VkDeviceCreateInfo create_device_info {};
     create_device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     create_device_info.pQueueCreateInfos = &queue_create_info;
@@ -182,8 +201,27 @@ ErrorOr<VulkanContext> create_vulkan_context()
     auto* instance = TRY(create_instance(api_version));
     auto* physical_device = TRY(pick_physical_device(instance));
 
+#ifdef USE_VULKAN_DMABUF_IMAGES
+    // Not every driver can share images as DMA-BUFs (Mesa's Dozen driver on WSL2 can't, for example). We still paint with
+    // such a device, and the painted images get shared with other processes through shared memory instead.
+    bool const supports_dmabuf_images = device_supports_dmabuf_images(physical_device);
+    ReadonlySpan<char const*> device_extensions;
+    if (supports_dmabuf_images) {
+        device_extensions = dmabuf_device_extensions.span();
+    } else {
+        // Except when the device is a CPU implementation of Vulkan, like Mesa's lavapipe: painting with it and reading
+        // every frame back would be slower than Skia's own CPU rasterizer.
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(physical_device, &properties);
+        if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+            return Error::from_string_literal("Vulkan device is a CPU implementation that can't share images as DMA-BUFs");
+    }
+#else
+    ReadonlySpan<char const*> device_extensions;
+#endif
+
     uint32_t graphics_queue_family = 0;
-    auto* logical_device = TRY(create_logical_device(physical_device, &graphics_queue_family));
+    auto* logical_device = TRY(create_logical_device(physical_device, device_extensions, &graphics_queue_family));
     VkQueue graphics_queue;
     vkGetDeviceQueue(logical_device, graphics_queue_family, 0, &graphics_queue);
 
@@ -191,13 +229,17 @@ ErrorOr<VulkanContext> create_vulkan_context()
     VkCommandPool command_pool = TRY(create_command_pool(logical_device, graphics_queue_family));
     VkCommandBuffer command_buffer = TRY(allocate_command_buffer(logical_device, command_pool));
 
-    auto pfn_vk_get_memory_fd_khr = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(logical_device, "vkGetMemoryFdKHR"));
-    if (pfn_vk_get_memory_fd_khr == nullptr) {
-        return Error::from_string_literal("vkGetMemoryFdKHR unavailable");
-    }
-    auto pfn_vk_get_image_drm_format_modifier_properties_khr = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(vkGetDeviceProcAddr(logical_device, "vkGetImageDrmFormatModifierPropertiesEXT"));
-    if (pfn_vk_get_image_drm_format_modifier_properties_khr == nullptr) {
-        return Error::from_string_literal("vkGetImageDrmFormatModifierPropertiesEXT unavailable");
+    PFN_vkGetMemoryFdKHR pfn_vk_get_memory_fd_khr = nullptr;
+    PFN_vkGetImageDrmFormatModifierPropertiesEXT pfn_vk_get_image_drm_format_modifier_properties_khr = nullptr;
+    if (supports_dmabuf_images) {
+        pfn_vk_get_memory_fd_khr = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(logical_device, "vkGetMemoryFdKHR"));
+        if (pfn_vk_get_memory_fd_khr == nullptr) {
+            return Error::from_string_literal("vkGetMemoryFdKHR unavailable");
+        }
+        pfn_vk_get_image_drm_format_modifier_properties_khr = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(vkGetDeviceProcAddr(logical_device, "vkGetImageDrmFormatModifierPropertiesEXT"));
+        if (pfn_vk_get_image_drm_format_modifier_properties_khr == nullptr) {
+            return Error::from_string_literal("vkGetImageDrmFormatModifierPropertiesEXT unavailable");
+        }
     }
 #endif
 
@@ -209,6 +251,7 @@ ErrorOr<VulkanContext> create_vulkan_context()
         .graphics_queue = graphics_queue,
         .graphics_queue_family = graphics_queue_family,
 #ifdef USE_VULKAN_DMABUF_IMAGES
+        .supports_dmabuf_images = supports_dmabuf_images,
         .command_pool = command_pool,
         .command_buffer = command_buffer,
         .ext_procs = {

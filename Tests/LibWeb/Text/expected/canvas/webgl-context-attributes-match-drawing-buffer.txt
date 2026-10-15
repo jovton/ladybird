@@ -1,0 +1,14 @@
+webgl depth=true stencil=true: stencil attribute matches the drawing buffer: true
+webgl depth=true stencil=true: depth attribute matches the drawing buffer: true
+webgl depth=false stencil=true: stencil attribute matches the drawing buffer: true
+webgl depth=false stencil=true: depth attribute matches the drawing buffer: true
+webgl depth=true stencil=false: stencil attribute matches the drawing buffer: true
+webgl depth=true stencil=false: depth attribute matches the drawing buffer: true
+webgl depth=true stencil=false: no stencil reported when none was requested: true
+webgl2 depth=true stencil=true: stencil attribute matches the drawing buffer: true
+webgl2 depth=true stencil=true: depth attribute matches the drawing buffer: true
+webgl2 depth=false stencil=true: stencil attribute matches the drawing buffer: true
+webgl2 depth=false stencil=true: depth attribute matches the drawing buffer: true
+webgl2 depth=true stencil=false: stencil attribute matches the drawing buffer: true
+webgl2 depth=true stencil=false: depth attribute matches the drawing buffer: true
+webgl2 depth=true stencil=false: no stencil reported when none was requested: true

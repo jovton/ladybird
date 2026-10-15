@@ -21,6 +21,8 @@ extern "C" {
 #include <EGL/eglext_angle.h>
 }
 
+#include <AK/Checked.h>
+#include <AK/ByteBuffer.h>
 #include <AK/HashMap.h>
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
@@ -50,9 +52,16 @@ struct OpenGLContext::Impl {
     EGLContext context { EGL_NO_CONTEXT };
     EGLSurface surface { EGL_NO_SURFACE };
 
+    // The drawing buffer's color, which gets painted. With antialiasing, the page draws into msaa_framebuffer instead,
+    // and it gets resolved into this one, see resolve_drawing_buffer().
     GLuint framebuffer { 0 };
     GLuint color_buffer { 0 };
+    // The depth and stencil of the framebuffer the page draws into (multisampled with antialiasing).
     GLuint depth_buffer { 0 };
+    GLuint msaa_framebuffer { 0 };
+    GLuint msaa_color_buffer { 0 };
+    // Whether a multisampled drawing buffer resolves correctly, found out once, see allocate_msaa_drawing_buffer().
+    Optional<bool> msaa_works {};
     EGLint texture_target { 0 };
     bool uses_cpu_painting_surface { false };
 
@@ -63,6 +72,25 @@ struct OpenGLContext::Impl {
         PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_dma_buf_modifiers { nullptr };
     } ext_procs;
 #endif
+
+    RefPtr<Gfx::Bitmap> readback_bitmap {};
+
+    // WebGL 2 contexts read their drawing buffer back into this pixel pack buffer without waiting for the GPU, see
+    // present_asynchronously().
+    GLuint readback_buffer { 0 };
+    Gfx::IntSize readback_buffer_size {};
+    bool readback_pending { false };
+
+    Optional<bool> uses_mesa_d3d12 {};
+
+    // Renderbuffers that the page gave a stencil format, but that got a depth-only one instead, see renderbuffer_storage().
+    HashMap<GLuint, GLenum> renderbuffers_without_stencil {};
+    // The same for texture images, see tex_storage2d(). A key names one attachable image: the texture, which of its
+    // images (see texture_image_kind()) and the mip level, see texture_image_key().
+    HashTable<u64> texture_images_without_stencil {};
+
+    // Errors taken from GL while checking a call of the page's, which get_error() reports before GL's own.
+    Vector<GLenum, 4> errors_taken_from_gl {};
 };
 
 OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
@@ -100,6 +128,23 @@ void OpenGLContext::free_surface_resources()
     if (m_impl->depth_buffer) {
         glDeleteRenderbuffers(1, &m_impl->depth_buffer);
         m_impl->depth_buffer = 0;
+    }
+
+    if (m_impl->msaa_framebuffer) {
+        glDeleteFramebuffers(1, &m_impl->msaa_framebuffer);
+        m_impl->msaa_framebuffer = 0;
+    }
+
+    if (m_impl->msaa_color_buffer) {
+        glDeleteRenderbuffers(1, &m_impl->msaa_color_buffer);
+        m_impl->msaa_color_buffer = 0;
+    }
+
+    if (m_impl->readback_buffer) {
+        glDeleteBuffers(1, &m_impl->readback_buffer);
+        m_impl->readback_buffer = 0;
+        m_impl->readback_buffer_size = {};
+        m_impl->readback_pending = false;
     }
 
 #    ifdef USE_VULKAN_DMABUF_IMAGES
@@ -155,6 +200,17 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
     bool use_cpu_painting_surface = true;
 #    else
     bool use_cpu_painting_surface = false;
+#    endif
+
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+    // The drawing buffer can only be shared with Skia's Vulkan device as a DMA-BUF, which not every device supports.
+    if (skia_backend_context && !skia_backend_context->vulkan_context().supports_dmabuf_images) {
+#        ifdef ENABLE_WEBGL_CPU_PAINTING_SURFACE
+        use_cpu_painting_surface = true;
+#        else
+        return {};
+#        endif
+    }
 #    endif
 
 #    if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES)
@@ -477,12 +533,20 @@ void OpenGLContext::allocate_cpu_painting_surface()
     glViewport(0, 0, m_size.width(), m_size.height());
 }
 
-void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
+Gfx::Bitmap& OpenGLContext::readback_bitmap()
 {
-    VERIFY(m_impl->uses_cpu_painting_surface);
-    VERIFY(m_painting_surface);
+    // The pixels only pass through this bitmap on their way into the painting surface, so it can be reused.
+    auto& bitmap = m_impl->readback_bitmap;
+    if (!bitmap || bitmap->size() != m_size)
+        bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Premultiplied, m_size));
+    return *bitmap;
+}
 
-    auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Premultiplied, m_size));
+// Reads the drawing buffer, bottom row first and tightly packed, into destination, or into the given pixel pack buffer at
+// the offset that destination stands for. The page's framebuffer binding and pixel pack state are left as they were.
+void OpenGLContext::read_default_framebuffer(u32 pixel_pack_buffer, void* destination)
+{
+    VERIFY(pixel_pack_buffer == 0 || m_webgl_version == WebGLVersion::WebGL2);
 
     GLenum framebuffer_target = GL_FRAMEBUFFER;
     GLenum framebuffer_binding = GL_FRAMEBUFFER_BINDING;
@@ -498,7 +562,8 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     if (m_webgl_version == WebGLVersion::WebGL2)
         glGetIntegerv(GL_READ_BUFFER, &original_read_buffer);
 
-    glBindFramebuffer(framebuffer_target, default_framebuffer());
+    resolve_drawing_buffer();
+    glBindFramebuffer(framebuffer_target, m_impl->framebuffer);
     if (m_webgl_version == WebGLVersion::WebGL2)
         glReadBuffer(GL_COLOR_ATTACHMENT0);
 
@@ -512,7 +577,7 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     GLint original_pack_skip_rows = 0;
     if (m_webgl_version == WebGLVersion::WebGL2) {
         glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pixel_pack_buffer);
 
         glGetIntegerv(GL_PACK_ROW_LENGTH, &original_pack_row_length);
         glGetIntegerv(GL_PACK_SKIP_PIXELS, &original_pack_skip_pixels);
@@ -522,8 +587,9 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
         glPixelStorei(GL_PACK_SKIP_ROWS, 0);
     }
 
-    for (int source_y = 0; source_y < m_size.height(); ++source_y)
-        glReadPixels(0, source_y, m_size.width(), 1, GL_RGBA, GL_UNSIGNED_BYTE, bitmap->scanline_u8(m_size.height() - source_y - 1));
+    // Read all rows with one call: reading back into client memory waits for the GPU, which is slow with a hardware
+    // driver.
+    glReadPixels(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, destination);
 
     if (m_webgl_version == WebGLVersion::WebGL2) {
         glPixelStorei(GL_PACK_ROW_LENGTH, original_pack_row_length);
@@ -536,8 +602,30 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     glBindFramebuffer(framebuffer_target, original_framebuffer);
     if (m_webgl_version == WebGLVersion::WebGL2)
         glReadBuffer(original_read_buffer);
+}
 
-    m_painting_surface->write_from_bitmap(*bitmap);
+void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
+{
+    VERIFY(m_impl->uses_cpu_painting_surface);
+    VERIFY(m_painting_surface);
+
+    // This reads the current frame, which supersedes one that is still being read back asynchronously.
+    m_impl->readback_pending = false;
+
+    auto& bitmap = readback_bitmap();
+    auto row_size = static_cast<size_t>(m_size.width()) * 4;
+    VERIFY(bitmap.pitch() == row_size);
+    read_default_framebuffer(0, bitmap.scanline_u8(0));
+
+    // GL's rows go from bottom to top, so flip them.
+    auto spare_row = MUST(ByteBuffer::create_uninitialized(row_size));
+    for (int top = 0, bottom = m_size.height() - 1; top < bottom; ++top, --bottom) {
+        memcpy(spare_row.data(), bitmap.scanline_u8(top), row_size);
+        memcpy(bitmap.scanline_u8(top), bitmap.scanline_u8(bottom), row_size);
+        memcpy(bitmap.scanline_u8(bottom), spare_row.data(), row_size);
+    }
+
+    m_painting_surface->write_from_bitmap(bitmap);
 }
 #endif
 
@@ -581,18 +669,22 @@ void OpenGLContext::allocate_painting_surface_if_needed()
     glBindFramebuffer(GL_FRAMEBUFFER, m_impl->framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_impl->texture_target == EGL_TEXTURE_RECTANGLE_ANGLE ? GL_TEXTURE_RECTANGLE_ANGLE : GL_TEXTURE_2D, m_impl->color_buffer, 0);
 
-    if (m_drawing_buffer_options.depth || m_drawing_buffer_options.stencil) {
+    auto stencil = m_drawing_buffer_options.stencil && drawing_buffer_can_have_stencil();
+    if (drawing_buffer_can_have_antialias() && allocate_msaa_drawing_buffer(stencil))
+        return;
+
+    if (m_drawing_buffer_options.depth || stencil) {
         glGenRenderbuffers(1, &m_impl->depth_buffer);
         glBindRenderbuffer(GL_RENDERBUFFER, m_impl->depth_buffer);
 
-        if (m_drawing_buffer_options.depth && m_drawing_buffer_options.stencil) {
+        if (m_drawing_buffer_options.depth && stencil) {
             glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, m_size.width(), m_size.height());
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
         } else if (m_drawing_buffer_options.depth) {
             glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, m_size.width(), m_size.height());
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
         } else {
-            VERIFY(m_drawing_buffer_options.stencil);
+            VERIFY(stencil);
             glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, m_size.width(), m_size.height());
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
         }
@@ -602,10 +694,926 @@ void OpenGLContext::allocate_painting_surface_if_needed()
 #endif
 }
 
+// Antialiasing gives the drawing buffer a multisampled framebuffer to draw into, which gets resolved into the one that
+// is painted. It needs OpenGL ES 3 for multisampled renderbuffers and glBlitFramebuffer(), so only WebGL 2 gets it:
+// WebGL 1 contexts are OpenGL ES 2 contexts.
+bool OpenGLContext::drawing_buffer_can_have_antialias()
+{
+#ifdef ENABLE_WEBGL
+    return m_drawing_buffer_options.antialias && m_webgl_version == WebGLVersion::WebGL2 && m_impl->msaa_works != false;
+#else
+    return false;
+#endif
+}
+
+bool OpenGLContext::drawing_buffer_has_antialias()
+{
+    make_current();
+    return m_impl->msaa_framebuffer != 0;
+}
+
+// Adds the multisampled framebuffer the page draws into, with the drawing buffer's depth and stencil, to
+// m_impl->framebuffer, which then just keeps the color. Returns false, allocating nothing, where that doesn't work.
+bool OpenGLContext::allocate_msaa_drawing_buffer(bool stencil)
+{
+#ifdef ENABLE_WEBGL
+    GLint max_samples = 0;
+    glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+    // 4 samples is what other browsers use, and what every OpenGL ES 3 implementation supports.
+    auto samples = min(max_samples, 4);
+    if (samples < 2) {
+        m_impl->msaa_works = false;
+        return false;
+    }
+
+    glGenFramebuffers(1, &m_impl->msaa_framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_impl->msaa_framebuffer);
+
+    // The color must match the resolve target's format exactly, which glTexImage2D(GL_RGBA, GL_UNSIGNED_BYTE) makes RGBA8.
+    glGenRenderbuffers(1, &m_impl->msaa_color_buffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_impl->msaa_color_buffer);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, m_size.width(), m_size.height());
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_impl->msaa_color_buffer);
+
+    if (m_drawing_buffer_options.depth || stencil) {
+        glGenRenderbuffers(1, &m_impl->depth_buffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, m_impl->depth_buffer);
+        if (m_drawing_buffer_options.depth && stencil) {
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        } else if (m_drawing_buffer_options.depth) {
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT24, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        } else {
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_STENCIL_INDEX8, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        }
+    }
+
+    // Find out once whether this works here, before the page has issued any GL commands, so that checking glGetError()
+    // can't swallow one of its errors: the resolve target's format differs on some painting surfaces.
+    if (!m_impl->msaa_works.has_value()) {
+        while (glGetError() != GL_NO_ERROR) { }
+        bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (complete)
+            resolve_drawing_buffer();
+        m_impl->msaa_works = complete && glGetError() == GL_NO_ERROR;
+    }
+
+    // Even where it works, a later allocation can fail, as pages can make the drawing buffer as large as GL allows and
+    // GPU memory can run out. The drawing buffer then just isn't antialiased, rather than taking the Compositor down.
+    if (!*m_impl->msaa_works || glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glDeleteFramebuffers(1, &m_impl->msaa_framebuffer);
+        glDeleteRenderbuffers(1, &m_impl->msaa_color_buffer);
+        if (m_impl->depth_buffer)
+            glDeleteRenderbuffers(1, &m_impl->depth_buffer);
+        m_impl->msaa_framebuffer = 0;
+        m_impl->msaa_color_buffer = 0;
+        m_impl->depth_buffer = 0;
+        glBindFramebuffer(GL_FRAMEBUFFER, m_impl->framebuffer);
+        return false;
+    }
+
+    return true;
+#else
+    (void)stencil;
+    return false;
+#endif
+}
+
+// Brings the painted framebuffer up to date with what the page drew into the multisampled one. Only the color gets
+// resolved: resolving multisampled depth can remove the GPU device with Mesa's d3d12 driver, see blit_framebuffer().
+void OpenGLContext::resolve_drawing_buffer()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->msaa_framebuffer)
+        return;
+
+    GLint original_read_framebuffer = 0;
+    GLint original_draw_framebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &original_read_framebuffer);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &original_draw_framebuffer);
+    // The scissor test applies to blits, and the page's scissor rectangle mustn't.
+    GLboolean scissor_test = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissor_test)
+        glDisable(GL_SCISSOR_TEST);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_impl->msaa_framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_impl->framebuffer);
+    glBlitFramebuffer(0, 0, m_size.width(), m_size.height(), 0, 0, m_size.width(), m_size.height(), GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    if (scissor_test)
+        glEnable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, original_read_framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, original_draw_framebuffer);
+#endif
+}
+
+// The page reads the drawing buffer's pixels from the resolved framebuffer, as a multisampled one can't be read.
+// Returns whether it redirected the read framebuffer, which end_reading_drawing_buffer() then undoes.
+bool OpenGLContext::begin_reading_drawing_buffer()
+{
+#ifdef ENABLE_WEBGL
+    if (!reads_antialiased_drawing_buffer())
+        return false;
+    resolve_drawing_buffer();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_impl->framebuffer);
+    return true;
+#else
+    return false;
+#endif
+}
+
+// Whether the read framebuffer is the page's drawing buffer, and that is antialiased.
+bool OpenGLContext::reads_antialiased_drawing_buffer()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->msaa_framebuffer)
+        return false;
+    GLint read_framebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+    return static_cast<GLuint>(read_framebuffer) == m_impl->msaa_framebuffer;
+#else
+    return false;
+#endif
+}
+
+void OpenGLContext::end_reading_drawing_buffer(bool redirected)
+{
+#ifdef ENABLE_WEBGL
+    if (redirected)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, m_impl->msaa_framebuffer);
+#else
+    (void)redirected;
+#endif
+}
+
+void OpenGLContext::read_pixels_robust_angle(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, GLsizei* length, GLsizei* columns, GLsizei* rows, void* pixels)
+{
+    auto redirected = begin_reading_drawing_buffer();
+    GLFunctions::read_pixels_robust_angle(x, y, width, height, format, type, buf_size, length, columns, rows, pixels);
+    end_reading_drawing_buffer(redirected);
+}
+
+void OpenGLContext::copy_tex_image2d(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
+{
+    auto redirected = begin_reading_drawing_buffer();
+    GLFunctions::copy_tex_image2d(target, level, internalformat, x, y, width, height, border);
+    end_reading_drawing_buffer(redirected);
+}
+
+void OpenGLContext::copy_tex_sub_image2d(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    auto redirected = begin_reading_drawing_buffer();
+    GLFunctions::copy_tex_sub_image2d(target, level, xoffset, yoffset, x, y, width, height);
+    end_reading_drawing_buffer(redirected);
+}
+
+bool OpenGLContext::drawing_buffer_has_stencil()
+{
+    make_current();
+    return m_drawing_buffer_options.stencil && drawing_buffer_can_have_stencil();
+}
+
+bool OpenGLContext::drawing_buffer_can_have_stencil()
+{
+#ifdef ENABLE_WEBGL
+    // With Mesa's d3d12 driver on WSL2 (seen with Mesa 26.2 on an Intel GPU), the first draw with the stencil test
+    // enabled on a framebuffer that has a stencil buffer removes the GPU device: nothing gets drawn from then on, in any
+    // WebGL context of the process. Without a stencil buffer, the stencil test just passes, so leave it out there.
+    // Framebuffers of the page's own get the same treatment, see renderbuffer_format_for().
+    // FIXME: Other operations can remove the device as well, like resolving multisampled depth (see blit_framebuffer()).
+    //        Detecting a lost device (create the contexts with EGL_LOSE_CONTEXT_ON_RESET_EXT and check
+    //        glGetGraphicsResetStatusEXT() after each frame) and letting the browser restart the Compositor would make
+    //        pages see webglcontextlost for the ones not worked around yet. Application::recover_compositor_process()
+    //        crashes the browser after three restarts, though, so a page that keeps doing this would need to be
+    //        stopped before then.
+    return !uses_mesa_d3d12();
+#else
+    return true;
+#endif
+}
+
+bool OpenGLContext::uses_mesa_d3d12()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->uses_mesa_d3d12.has_value()) {
+        auto const* renderer = reinterpret_cast<char const*>(glGetString(GL_RENDERER));
+        m_impl->uses_mesa_d3d12 = renderer && StringView { renderer, strlen(renderer) }.contains("D3D12"sv);
+    }
+    return *m_impl->uses_mesa_d3d12;
+#else
+    return false;
+#endif
+}
+
+void OpenGLContext::blit_framebuffer(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter)
+{
+#ifdef ENABLE_WEBGL
+    // With Mesa's d3d12 driver on WSL2 (seen with Mesa 26.2 on an Intel GPU), resolving the depth of a multisampled
+    // framebuffer removes the GPU device, unless its depth buffer is DEPTH_COMPONENT16 or DEPTH_COMPONENT32F: nothing
+    // gets drawn from then on, in any WebGL context of the process. three.js does this for every multisampled render
+    // target. Resolving just the color keeps pages working, as few of them read the resolved depth back. Only valid calls
+    // get that: GL rejects depth or stencil with GL_LINEAR before blitting anything.
+    if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) && filter == GL_NEAREST && uses_mesa_d3d12() && read_framebuffer_has_unresolvable_depth()) {
+        mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        if (!mask)
+            return;
+    }
+
+    // Blitting color from an antialiased drawing buffer reads the resolved one, like any other read of its pixels. Its
+    // depth and stencil stay in the multisampled framebuffer, so blitting them as well takes two calls. GL checks each
+    // on its own, but the page's call has to fail as a whole, without blitting either part, so GL checks it first.
+    if (mask & GL_COLOR_BUFFER_BIT) {
+        if ((mask & ~GL_COLOR_BUFFER_BIT) && reads_antialiased_drawing_buffer() && !blit_framebuffer_would_succeed(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter))
+            return;
+        if (auto redirected = begin_reading_drawing_buffer()) {
+            GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, GL_COLOR_BUFFER_BIT, filter);
+            end_reading_drawing_buffer(redirected);
+            mask &= ~GL_COLOR_BUFFER_BIT;
+            if (!mask)
+                return;
+        }
+    }
+#endif
+    GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+}
+
+// Makes the call with a scissor box that no pixel passes, so that GL checks all of it (filter, mask, rectangles, the
+// framebuffers' completeness, formats and samples) without blitting anything. An error it generates stays for the page.
+bool OpenGLContext::blit_framebuffer_would_succeed(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1, GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1, GLbitfield mask, GLenum filter)
+{
+#ifdef ENABLE_WEBGL
+    // The page's earlier errors come first.
+    take_errors_from_gl();
+
+    GLboolean scissor_test = glIsEnabled(GL_SCISSOR_TEST);
+    GLint scissor_box[4] {};
+    glGetIntegerv(GL_SCISSOR_BOX, scissor_box);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 0, 0);
+    GLFunctions::blit_framebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+    glScissor(scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3]);
+    if (!scissor_test)
+        glDisable(GL_SCISSOR_TEST);
+
+    return take_errors_from_gl() == 0;
+#else
+    (void)src_x0, (void)src_y0, (void)src_x1, (void)src_y1, (void)dst_x0, (void)dst_y0, (void)dst_x1, (void)dst_y1, (void)mask, (void)filter;
+    return true;
+#endif
+}
+
+// Takes GL's errors, keeping them for get_error(), and returns how many there were. Like GL, this keeps each error once.
+// Taking the page's errors before one of its calls, and the call's own after it, tells whether GL accepted the call.
+size_t OpenGLContext::take_errors_from_gl()
+{
+    size_t count = 0;
+#ifdef ENABLE_WEBGL
+    for (auto error = glGetError(); error != GL_NO_ERROR; error = glGetError()) {
+        ++count;
+        if (!m_impl->errors_taken_from_gl.contains_slow(error))
+            m_impl->errors_taken_from_gl.append(error);
+    }
+#endif
+    return count;
+}
+
+GLenum OpenGLContext::get_error()
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->errors_taken_from_gl.is_empty())
+        return m_impl->errors_taken_from_gl.take_first();
+#endif
+    return GLFunctions::get_error();
+}
+
+// Keeps an error for get_error() that a call of the page's gets without reaching GL. Errors GL has from earlier calls
+// must have been taken first, as they come before it.
+void OpenGLContext::keep_error(GLenum error)
+{
+#ifdef ENABLE_WEBGL
+    if (!m_impl->errors_taken_from_gl.contains_slow(error))
+        m_impl->errors_taken_from_gl.append(error);
+#else
+    (void)error;
+#endif
+}
+
+// Picks a depth-only format for a format with stencil, or returns the format as it is.
+static GLenum format_without_stencil(GLenum format)
+{
+    switch (format) {
+    case GL_DEPTH24_STENCIL8:
+    case GL_DEPTH_STENCIL_OES:
+        return GL_DEPTH_COMPONENT24;
+    case GL_DEPTH32F_STENCIL8:
+        return GL_DEPTH_COMPONENT32F;
+    case GL_STENCIL_INDEX8:
+        return GL_DEPTH_COMPONENT16;
+    default:
+        return format;
+    }
+}
+
+GLenum OpenGLContext::renderbuffer_format_for(GLenum format)
+{
+#ifdef ENABLE_WEBGL
+    // Pages can give framebuffers of their own a stencil buffer, which runs into the same device loss with Mesa's d3d12
+    // driver as the drawing buffer does, see drawing_buffer_can_have_stencil(). So they get depth only there, too.
+    return uses_mesa_d3d12() ? format_without_stencil(format) : format;
+#else
+    return format;
+#endif
+}
+
+// Records the format substitution of the bound renderbuffer, once GL has allocated its storage. GL can reject the
+// allocation, keeping the renderbuffer as it was, which only its error tells apart: a renderbuffer can already have the
+// size and format that the rejected call asked for.
+void OpenGLContext::note_renderbuffer_storage(GLenum requested_format, GLenum format)
+{
+#ifdef ENABLE_WEBGL
+    GLint renderbuffer = 0;
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
+    if (!renderbuffer)
+        return;
+    if (format != requested_format)
+        m_impl->renderbuffers_without_stencil.set(static_cast<GLuint>(renderbuffer), requested_format);
+    else
+        m_impl->renderbuffers_without_stencil.remove(static_cast<GLuint>(renderbuffer));
+#else
+    (void)requested_format;
+    (void)format;
+#endif
+}
+
+void OpenGLContext::renderbuffer_storage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    if (!uses_mesa_d3d12()) {
+        GLFunctions::renderbuffer_storage(target, internalformat, width, height);
+        return;
+    }
+    auto format = renderbuffer_format_for(internalformat);
+    take_errors_from_gl();
+    GLFunctions::renderbuffer_storage(target, format, width, height);
+    if (take_errors_from_gl() == 0)
+        note_renderbuffer_storage(internalformat, format);
+}
+
+void OpenGLContext::renderbuffer_storage_multisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    if (!uses_mesa_d3d12()) {
+        GLFunctions::renderbuffer_storage_multisample(target, samples, internalformat, width, height);
+        return;
+    }
+    auto format = renderbuffer_format_for(internalformat);
+    take_errors_from_gl();
+    GLFunctions::renderbuffer_storage_multisample(target, samples, format, width, height);
+    if (take_errors_from_gl() == 0)
+        note_renderbuffer_storage(internalformat, format);
+}
+
+void OpenGLContext::delete_renderbuffers(GLsizei n, GLuint const* renderbuffers)
+{
+#ifdef ENABLE_WEBGL
+    // GL may give a deleted renderbuffer's name to a new one, which must not inherit the old one's substitution.
+    for (GLsizei i = 0; i < n; ++i)
+        m_impl->renderbuffers_without_stencil.remove(renderbuffers[i]);
+#endif
+    GLFunctions::delete_renderbuffers(n, renderbuffers);
+}
+
+void OpenGLContext::framebuffer_renderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
+{
+#ifdef ENABLE_WEBGL
+    if (auto original_format = m_impl->renderbuffers_without_stencil.get(renderbuffer); original_format.has_value()) {
+        // The renderbuffer has no stencil, so it can only be the depth attachment, if the page wanted depth from it.
+        bool has_depth = *original_format != GL_STENCIL_INDEX8;
+        if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+            attach_as_depth_and_detach_stencil([&](GLenum attachment, bool detach) {
+                GLFunctions::framebuffer_renderbuffer(target, attachment, renderbuffertarget, detach || !has_depth ? 0 : renderbuffer);
+            });
+            return;
+        }
+        if (attachment == GL_STENCIL_ATTACHMENT || (attachment == GL_DEPTH_ATTACHMENT && !has_depth))
+            renderbuffer = 0;
+    }
+#endif
+    GLFunctions::framebuffer_renderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+}
+
+// GL attaches an image given as depth-stencil to both the depth and the stencil attachment point, replacing what either
+// had. One that got a depth-only format can only go to the depth point, but the stencil point still has to lose what it
+// had, as it would have with GL. It does so only once GL has accepted the image as depth, as a call GL rejects changes
+// nothing. attach(attachment, detach) makes the page's call for that attachment point, attaching nothing if detach is
+// set.
+void OpenGLContext::attach_as_depth_and_detach_stencil(Function<void(GLenum, bool)> const& attach)
+{
+    take_errors_from_gl();
+    attach(GL_DEPTH_ATTACHMENT, false);
+    if (take_errors_from_gl() == 0)
+        attach(GL_STENCIL_ATTACHMENT, true);
+}
+
+// Depth-stencil textures run into the same device loss with Mesa's d3d12 driver as stencil renderbuffers do (clearing
+// their stencil is enough), see renderbuffer_format_for(). So on d3d12 every depth-stencil texture image gets a
+// depth-only format, whichever call allocates it (tex_storage2d(), tex_storage3d(), tex_image2d_robust_angle(),
+// tex_image3d_robust_angle()) and whatever its mip level, and is only ever attached as depth. WebGL can attach any mip
+// level of a 2D texture or cube map face, and any layer of a 2D array texture (depth formats can't be 3D textures), so
+// what got substituted is tracked per attachable image: the texture, the kind of image and the mip level. The layers of
+// a 2D array texture share their level's format.
+
+// Which image of a texture a target names: 0 for a 2D texture, 1 to 6 for the faces of a cube map, 7 for a 2D array
+// texture. Other targets can't hold depth.
+static Optional<u8> texture_image_kind(GLenum target)
+{
+    if (target == GL_TEXTURE_2D)
+        return 0;
+    if (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
+        return static_cast<u8>(1 + target - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
+    if (target == GL_TEXTURE_2D_ARRAY)
+        return 7;
+    return {};
+}
+
+static u64 texture_image_key(GLuint texture, u8 kind, GLint level)
+{
+    return (static_cast<u64>(texture) << 32) | (static_cast<u64>(kind) << 16) | static_cast<u16>(level);
+}
+
+static GLenum texture_binding_for(GLenum target)
+{
+    if (target == GL_TEXTURE_2D)
+        return GL_TEXTURE_BINDING_2D;
+    if (target == GL_TEXTURE_CUBE_MAP || (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z))
+        return GL_TEXTURE_BINDING_CUBE_MAP;
+    if (target == GL_TEXTURE_2D_ARRAY)
+        return GL_TEXTURE_BINDING_2D_ARRAY;
+    return GL_NONE;
+}
+
+static GLenum depth_only_format_for(GLenum internalformat)
+{
+    if (internalformat == GL_DEPTH24_STENCIL8)
+        return GL_DEPTH_COMPONENT24;
+    if (internalformat == GL_DEPTH32F_STENCIL8)
+        return GL_DEPTH_COMPONENT32F;
+    return internalformat;
+}
+
+// GL accepts 1 to log2(largest dimension) + 1 mip levels, and rejects other counts, allocating nothing. Nothing may be
+// tracked for those either: a page asking for 2^31 levels would otherwise keep the Compositor busy for minutes.
+static bool is_valid_level_count(GLsizei levels, GLsizei width, GLsizei height)
+{
+    if (levels < 1 || width < 1 || height < 1)
+        return false;
+    auto largest = static_cast<u32>(max(width, height));
+    GLsizei max_levels = 1;
+    while (largest >>= 1)
+        ++max_levels;
+    return levels <= max_levels;
+}
+
+// No texture can have mip levels beyond this, whatever its size, so GL rejects them.
+static constexpr GLint max_mip_level = 31;
+
+// A depth-stencil upload, turned into a depth-only one by drop_stencil_from_upload().
+struct DepthOnlyUpload {
+    // Set when the data had to be repacked. It's tightly packed, unlike the page's data, see UnpackStateOverride. Small
+    // data lives inside the ByteBuffer, so the upload must use it where it ends up, see use_repacked_data().
+    ByteBuffer repacked;
+    // Set when the data couldn't be repacked. The upload must then not reach GL at all, see drop_stencil_from_upload().
+    GLenum error { GL_NO_ERROR };
+};
+
+// The low bits that make a 24-bit depth exact as UNSIGNED_INT depth data. GL turns such data into a depth by dividing it
+// by 2^32 - 1, so depth << 8 alone comes out up to a step lower than depth / (2^24 - 1). These bits make the 32-bit value
+// at least that, and less than a 256th of a step more, which keeps the depth whether GL rounds, truncates or shifts.
+static u32 low_bits_of_depth24(u32 depth)
+{
+    return static_cast<u32>((static_cast<u64>(depth) * 255 + 0xfffffe) / 0xffffff);
+}
+
+// Repacks the depths of depth-stencil data into tightly packed depth-only data of 4 bytes per texel. An UNSIGNED_INT_24_8
+// texel keeps its depth in its upper 24 bits and its stencil in the lower 8, which become UNSIGNED_INT data without the
+// stencil. A FLOAT_32_UNSIGNED_INT_24_8_REV texel has 8 bytes, a float depth followed by the stencil, which become FLOAT
+// data. Data that GL would reject gets the error GL gives it, so that the upload never needs GL to see it.
+static ErrorOr<ByteBuffer, GLenum> repack_depths(GLenum type, GLsizei width, GLsizei height, GLsizei depth, GLsizei buf_size, void const* pixels, bool is_3d)
+{
+    GLint alignment = 4, row_length = 0, skip_pixels = 0, skip_rows = 0, image_height = 0, skip_images = 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    if (is_3d) {
+        glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &image_height);
+        glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_images);
+    }
+    if (alignment < 1 || row_length < 0 || skip_pixels < 0 || skip_rows < 0 || image_height < 0 || skip_images < 0)
+        return GL_INVALID_OPERATION;
+
+    // The page's data is laid out the way GL reads it, see "Unpacking" in the OpenGL ES 3.0 spec. All of this is
+    // page-controlled and not validated by GL yet, so every step is checked for overflow. Data whose end overflows can't
+    // fit in buf_size, which GL rejects as INVALID_OPERATION. Once the end of the data is known to fit in buf_size, no
+    // offset of a texel before it can overflow.
+    u64 const texel_size = type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV ? 8 : 4;
+    Checked<u64> row_stride = static_cast<u64>(row_length > 0 ? row_length : width);
+    row_stride *= texel_size;
+    row_stride += static_cast<u64>(alignment - 1);
+    if (row_stride.has_overflow())
+        return GL_INVALID_OPERATION;
+    u64 aligned_row_stride = row_stride.value() / static_cast<u64>(alignment) * static_cast<u64>(alignment);
+    Checked<u64> image_stride = aligned_row_stride;
+    image_stride *= static_cast<u64>(image_height > 0 ? image_height : height);
+    if (image_stride.has_overflow())
+        return GL_INVALID_OPERATION;
+
+    Checked<u64> end = static_cast<u64>(skip_images) + static_cast<u64>(depth) - 1;
+    end *= image_stride.value();
+    Checked<u64> rows = static_cast<u64>(skip_rows) + static_cast<u64>(height) - 1;
+    rows *= aligned_row_stride;
+    end += rows;
+    Checked<u64> pixels_in_row = static_cast<u64>(skip_pixels) + static_cast<u64>(width);
+    pixels_in_row *= texel_size;
+    end += pixels_in_row;
+    if (end.has_overflow() || end.value() > static_cast<u64>(max(buf_size, 0)))
+        return GL_INVALID_OPERATION;
+
+    auto offset_of = [&](u64 x, u64 y, u64 z) {
+        return (static_cast<u64>(skip_images) + z) * image_stride.value() + (static_cast<u64>(skip_rows) + y) * aligned_row_stride + (static_cast<u64>(skip_pixels) + x) * texel_size;
+    };
+    // The data's end doesn't bound the repacked size: rows and images can overlap (e.g. UNPACK_ROW_LENGTH = 1), so the
+    // texel count can be far larger, up to overflowing. Like a repacked size that doesn't fit buf_size's type, that's
+    // more than GL could allocate a texture for.
+    Checked<size_t> repacked_size = static_cast<size_t>(width);
+    repacked_size *= static_cast<size_t>(height);
+    repacked_size *= static_cast<size_t>(depth);
+    repacked_size *= sizeof(u32);
+    if (repacked_size.has_overflow() || repacked_size.value() > static_cast<size_t>(NumericLimits<GLsizei>::max()))
+        return GL_OUT_OF_MEMORY;
+    auto repacked_or_error = ByteBuffer::create_uninitialized(repacked_size.value());
+    if (repacked_or_error.is_error())
+        return GL_OUT_OF_MEMORY;
+    auto repacked = repacked_or_error.release_value();
+
+    auto const* source = static_cast<u8 const*>(pixels);
+    auto* destination = repacked.data();
+    for (GLsizei z = 0; z < depth; ++z) {
+        for (GLsizei y = 0; y < height; ++y) {
+            for (GLsizei x = 0; x < width; ++x) {
+                u32 texel = 0;
+                memcpy(&texel, source + offset_of(x, y, z), sizeof(u32));
+                if (type == GL_UNSIGNED_INT_24_8_OES)
+                    texel = (texel & 0xffffff00) | low_bits_of_depth24(texel >> 8);
+                memcpy(destination, &texel, sizeof(u32));
+                destination += sizeof(u32);
+            }
+        }
+    }
+    return repacked;
+}
+
+// Turns a depth-stencil upload into a depth-only one. Without data, which is how render targets get made, that only means
+// other formats, otherwise the data gets repacked, see repack_depths(). Returns nothing if the upload isn't depth-stencil,
+// which leaves it to GL unchanged. Once it is, the original upload must not reach GL, as GL would then allocate the
+// stencil this exists to avoid: if the data can't be repacked, the result has the error the upload gets instead.
+static Optional<DepthOnlyUpload> drop_stencil_from_upload(GLint* internalformat, GLenum& format, GLenum& type, GLsizei width, GLsizei height, GLsizei depth, GLsizei buf_size, void const* pixels, bool is_3d)
+{
+    if (format != GL_DEPTH_STENCIL_OES || width < 0 || height < 0 || depth < 0)
+        return {};
+    if (type != GL_UNSIGNED_INT_24_8_OES && type != GL_FLOAT_32_UNSIGNED_INT_24_8_REV)
+        return {};
+
+    // Only the internal formats that go with the data become depth-only, anything else (like GL_RGBA8 with depth-stencil
+    // data) reaches GL unchanged, which rejects it. Uploads into existing images (texSubImage) have no internal format.
+    if (internalformat) {
+        bool matches = type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV
+            ? *internalformat == GL_DEPTH32F_STENCIL8
+            : *internalformat == GL_DEPTH24_STENCIL8 || *internalformat == GL_DEPTH_STENCIL_OES;
+        if (!matches)
+            return {};
+    }
+
+    DepthOnlyUpload upload;
+    if (pixels && width > 0 && height > 0 && depth > 0) {
+        auto repacked = repack_depths(type, width, height, depth, buf_size, pixels, is_3d);
+        if (repacked.is_error()) {
+            upload.error = repacked.error();
+            return upload;
+        }
+        upload.repacked = repacked.release_value();
+    }
+    if (type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) {
+        if (internalformat)
+            *internalformat = GL_DEPTH_COMPONENT32F;
+        type = GL_FLOAT;
+    } else {
+        if (internalformat)
+            *internalformat = *internalformat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT;
+        type = GL_UNSIGNED_INT;
+    }
+    format = GL_DEPTH_COMPONENT;
+    return upload;
+}
+
+// Makes an upload use its repacked data, if it has any.
+static void use_repacked_data(Optional<DepthOnlyUpload> const& upload, GLsizei& buf_size, void const*& pixels)
+{
+    if (!upload.has_value() || upload->repacked.is_empty())
+        return;
+    pixels = upload->repacked.data();
+    buf_size = static_cast<GLsizei>(upload->repacked.size());
+}
+
+// Sets tightly packed unpack state for uploading repacked data, and puts the page's back afterwards.
+class UnpackStateOverride {
+public:
+    explicit UnpackStateOverride(bool active)
+        : m_active(active)
+    {
+        if (!m_active)
+            return;
+        for (size_t i = 0; i < parameters.size(); ++i) {
+            glGetIntegerv(parameters[i], &m_saved[i]);
+            glPixelStorei(parameters[i], parameters[i] == GL_UNPACK_ALIGNMENT ? 4 : 0);
+        }
+    }
+
+    ~UnpackStateOverride()
+    {
+        if (!m_active)
+            return;
+        for (size_t i = 0; i < parameters.size(); ++i)
+            glPixelStorei(parameters[i], m_saved[i]);
+    }
+
+private:
+    static constexpr Array<GLenum, 6> parameters { GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_ROWS, GL_UNPACK_IMAGE_HEIGHT, GL_UNPACK_SKIP_IMAGES };
+    bool m_active { false };
+    Array<GLint, 6> m_saved {};
+};
+
+void OpenGLContext::note_texture_stencil(GLenum target, GLint first_level, GLint level_count, bool has_stencil_dropped)
+{
+    auto binding = texture_binding_for(target);
+    if (binding == GL_NONE)
+        return;
+    GLint texture = 0;
+    glGetIntegerv(binding, &texture);
+
+    // Allocating a whole cube map (texStorage2D) covers all of its faces.
+    Vector<u8, 6> kinds;
+    if (target == GL_TEXTURE_CUBE_MAP) {
+        for (u8 face = 1; face <= 6; ++face)
+            kinds.append(face);
+    } else if (auto kind = texture_image_kind(target); kind.has_value()) {
+        kinds.append(*kind);
+    }
+
+    for (auto kind : kinds) {
+        for (GLint level = first_level; level < first_level + level_count; ++level) {
+            auto key = texture_image_key(static_cast<GLuint>(texture), kind, level);
+            if (has_stencil_dropped)
+                m_impl->texture_images_without_stencil.set(key);
+            else
+                m_impl->texture_images_without_stencil.remove(key);
+        }
+    }
+}
+
+// Whether the texture bound to target is immutable, i.e. has storage from texStorage2D()/texStorage3D(), and how many levels
+// it got. Only WebGL 2 contexts have immutable textures.
+static Optional<GLint> immutable_levels_of_bound_texture(GLenum target)
+{
+    auto parameter_target = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? GL_TEXTURE_CUBE_MAP : target;
+    GLint immutable = GL_FALSE;
+    glGetTexParameteriv(parameter_target, GL_TEXTURE_IMMUTABLE_FORMAT, &immutable);
+    if (!immutable)
+        return {};
+    GLint levels = 0;
+    glGetTexParameteriv(parameter_target, GL_TEXTURE_IMMUTABLE_LEVELS, &levels);
+    return levels;
+}
+
+void OpenGLContext::tex_storage2d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
+{
+#ifdef ENABLE_WEBGL
+    if (uses_mesa_d3d12() && texture_binding_for(target) != GL_NONE) {
+        auto depth_only_format = depth_only_format_for(internalformat);
+        // GL rejects storage for a texture that already has some, and impossible level counts, keeping the texture as it
+        // was. Only a texture that GL made immutable with these levels got them.
+        bool was_immutable = immutable_levels_of_bound_texture(target).has_value();
+        GLFunctions::tex_storage2d(target, levels, depth_only_format, width, height);
+        if (!was_immutable && is_valid_level_count(levels, width, height) && immutable_levels_of_bound_texture(target) == levels)
+            note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
+        return;
+    }
+#endif
+    GLFunctions::tex_storage2d(target, levels, internalformat, width, height);
+}
+
+void OpenGLContext::tex_storage3d(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
+{
+#ifdef ENABLE_WEBGL
+    if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY) {
+        auto depth_only_format = depth_only_format_for(internalformat);
+        bool was_immutable = immutable_levels_of_bound_texture(target).has_value();
+        GLFunctions::tex_storage3d(target, levels, depth_only_format, width, height, depth);
+        // The layers of a 2D array texture don't get smaller with its mip levels.
+        if (!was_immutable && is_valid_level_count(levels, width, height) && immutable_levels_of_bound_texture(target) == levels)
+            note_texture_stencil(target, 0, levels, depth_only_format != internalformat);
+        return;
+    }
+#endif
+    GLFunctions::tex_storage3d(target, levels, internalformat, width, height, depth);
+}
+
+void OpenGLContext::tex_image2d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    if (uses_mesa_d3d12() && texture_image_kind(target).has_value() && level >= 0 && level <= max_mip_level) {
+        auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, 1, buf_size, pixels, false);
+        take_errors_from_gl();
+        if (upload.has_value() && upload->error != GL_NO_ERROR) {
+            keep_error(upload->error);
+            return;
+        }
+        {
+            use_repacked_data(upload, buf_size, pixels);
+            UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+            GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
+        }
+        if (take_errors_from_gl() == 0)
+            note_texture_stencil(target, level, 1, upload.has_value());
+        return;
+    }
+#endif
+    GLFunctions::tex_image2d_robust_angle(target, level, internalformat, width, height, border, format, type, buf_size, pixels);
+}
+
+void OpenGLContext::tex_image3d_robust_angle(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    if (uses_mesa_d3d12() && target == GL_TEXTURE_2D_ARRAY && level >= 0 && level <= max_mip_level) {
+        auto upload = drop_stencil_from_upload(&internalformat, format, type, width, height, depth, buf_size, pixels, true);
+        take_errors_from_gl();
+        if (upload.has_value() && upload->error != GL_NO_ERROR) {
+            keep_error(upload->error);
+            return;
+        }
+        {
+            use_repacked_data(upload, buf_size, pixels);
+            UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+            GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
+        }
+        if (take_errors_from_gl() == 0)
+            note_texture_stencil(target, level, 1, upload.has_value());
+        return;
+    }
+#endif
+    GLFunctions::tex_image3d_robust_angle(target, level, internalformat, width, height, depth, border, format, type, buf_size, pixels);
+}
+
+// Whether the image at the given level of the texture bound to target got a depth-only format, see note_texture_stencil().
+bool OpenGLContext::bound_texture_image_has_stencil_dropped(GLenum target, GLint level)
+{
+    auto kind = texture_image_kind(target);
+    auto binding = texture_binding_for(target);
+    if (!kind.has_value() || binding == GL_NONE || level < 0 || level > max_mip_level)
+        return false;
+    GLint texture = 0;
+    glGetIntegerv(binding, &texture);
+    return m_impl->texture_images_without_stencil.contains(texture_image_key(static_cast<GLuint>(texture), *kind, level));
+}
+
+// Depth-stencil data for an image that got a depth-only format has to become depth-only data as well, or GL rejects it.
+void OpenGLContext::tex_sub_image2d_robust_angle(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    Optional<DepthOnlyUpload> upload;
+    if (format == GL_DEPTH_STENCIL_OES && !m_impl->texture_images_without_stencil.is_empty() && bound_texture_image_has_stencil_dropped(target, level))
+        upload = drop_stencil_from_upload(nullptr, format, type, width, height, 1, buf_size, pixels, false);
+    if (upload.has_value() && upload->error != GL_NO_ERROR) {
+        take_errors_from_gl();
+        keep_error(upload->error);
+        return;
+    }
+    use_repacked_data(upload, buf_size, pixels);
+    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+#endif
+    GLFunctions::tex_sub_image2d_robust_angle(target, level, xoffset, yoffset, width, height, format, type, buf_size, pixels);
+}
+
+void OpenGLContext::tex_sub_image3d_robust_angle(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, GLsizei buf_size, void const* pixels)
+{
+#ifdef ENABLE_WEBGL
+    Optional<DepthOnlyUpload> upload;
+    if (format == GL_DEPTH_STENCIL_OES && !m_impl->texture_images_without_stencil.is_empty() && bound_texture_image_has_stencil_dropped(target, level))
+        upload = drop_stencil_from_upload(nullptr, format, type, width, height, depth, buf_size, pixels, true);
+    if (upload.has_value() && upload->error != GL_NO_ERROR) {
+        take_errors_from_gl();
+        keep_error(upload->error);
+        return;
+    }
+    use_repacked_data(upload, buf_size, pixels);
+    UnpackStateOverride unpack_state { upload.has_value() && !upload->repacked.is_empty() };
+#endif
+    GLFunctions::tex_sub_image3d_robust_angle(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, buf_size, pixels);
+}
+
+// A texture image that has no stencil can only be the depth attachment. Returns whether it's attached as depth-stencil,
+// which takes attach_as_depth_and_detach_stencil().
+bool OpenGLContext::attach_texture_image_without_stencil(GLenum& attachment, GLuint& texture, u8 kind, GLint level)
+{
+    if (!m_impl->texture_images_without_stencil.contains(texture_image_key(texture, kind, level)))
+        return false;
+    if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
+        return true;
+    if (attachment == GL_STENCIL_ATTACHMENT)
+        texture = 0;
+    return false;
+}
+
+void OpenGLContext::framebuffer_texture2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
+{
+#ifdef ENABLE_WEBGL
+    if (auto kind = texture_image_kind(textarget); kind.has_value() && texture != 0 && attach_texture_image_without_stencil(attachment, texture, *kind, level)) {
+        attach_as_depth_and_detach_stencil([&](GLenum attachment, bool detach) {
+            GLFunctions::framebuffer_texture2d(target, attachment, textarget, detach ? 0 : texture, level);
+        });
+        return;
+    }
+#endif
+    GLFunctions::framebuffer_texture2d(target, attachment, textarget, texture, level);
+}
+
+void OpenGLContext::framebuffer_texture_layer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer)
+{
+#ifdef ENABLE_WEBGL
+    // Of the textures with layers, only 2D arrays can hold depth.
+    if (texture != 0 && attach_texture_image_without_stencil(attachment, texture, *texture_image_kind(GL_TEXTURE_2D_ARRAY), level)) {
+        attach_as_depth_and_detach_stencil([&](GLenum attachment, bool detach) {
+            GLFunctions::framebuffer_texture_layer(target, attachment, detach ? 0 : texture, level, layer);
+        });
+        return;
+    }
+#endif
+    GLFunctions::framebuffer_texture_layer(target, attachment, texture, level, layer);
+}
+
+void OpenGLContext::delete_textures(GLsizei n, GLuint const* textures)
+{
+#ifdef ENABLE_WEBGL
+    // GL may give a deleted texture's name to a new texture, which must not inherit the old one's substitutions.
+    if (!m_impl->texture_images_without_stencil.is_empty()) {
+        for (GLsizei i = 0; i < n; ++i) {
+            auto texture = static_cast<u64>(textures[i]);
+            m_impl->texture_images_without_stencil.remove_all_matching([&](u64 key) { return (key >> 32) == texture; });
+        }
+    }
+#endif
+    GLFunctions::delete_textures(n, textures);
+}
+
+bool OpenGLContext::read_framebuffer_has_unresolvable_depth()
+{
+#ifdef ENABLE_WEBGL
+    GLint read_framebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+    if (read_framebuffer == 0 || static_cast<GLuint>(read_framebuffer) == m_impl->framebuffer)
+        return false;
+
+    for (GLenum attachment : { GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT }) {
+        GLint type = GL_NONE;
+        glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+        if (type != GL_RENDERBUFFER)
+            continue;
+        GLint renderbuffer = 0;
+        glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &renderbuffer);
+
+        GLint original_renderbuffer = 0;
+        glGetIntegerv(GL_RENDERBUFFER_BINDING, &original_renderbuffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+        GLint samples = 0;
+        GLint format = GL_NONE;
+        glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &samples);
+        glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_INTERNAL_FORMAT, &format);
+        glBindRenderbuffer(GL_RENDERBUFFER, original_renderbuffer);
+
+        if (samples > 0 && format != GL_DEPTH_COMPONENT16 && format != GL_DEPTH_COMPONENT32F)
+            return true;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
 void OpenGLContext::set_size(Gfx::IntSize const& size)
 {
     if (m_size != size) {
         m_painting_surface = nullptr;
+        m_impl->readback_pending = false;
     }
     m_size = size;
 }
@@ -623,26 +1631,97 @@ void OpenGLContext::present()
 #ifdef ENABLE_WEBGL
     make_current();
 
+#    if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    if (m_impl->uses_cpu_painting_surface) {
+        // Reading the drawing buffer back waits for all rendering to it to finish, so it needs no glFinish(). The glFlush()
+        // works around a deadlock in the d3d12 driver of Mesa 26.2 (which WSL2 uses): reading back 32 to 64 KiB, like a
+        // 100x100 canvas, gets a staging buffer that takes up a whole slab, so the next readback needs a new slab. While
+        // creating it, the driver frees the buffers the GPU is done with, still holding the slab allocator's lock
+        // (d3d12_bo_new() calls d3d12_screen_reclaim_completed() inside pb_slab_manager_create_buffer()). Freeing the
+        // previous readback's staging buffer then takes that same lock, and the Compositor hangs. Submitting the frame
+        // first frees those buffers with no lock held. It doesn't help when nothing was drawn since the last readback,
+        // as there's nothing to submit then. The asynchronous readback isn't affected, since Mesa never puts a pixel pack
+        // buffer in a slab.
+        glFlush();
+        copy_default_framebuffer_to_cpu_painting_surface();
+        return;
+    }
+#    endif
+
+    // The painting surface is the resolved framebuffer's color.
+    resolve_drawing_buffer();
+
     // "Before the drawing buffer is presented for compositing the implementation shall ensure that all rendering operations have been flushed to the drawing buffer."
     // With Metal, glFlush flushes the command buffer, but without waiting for it to be scheduled or completed.
     // eglWaitUntilWorkScheduledANGLE flushes the command buffer, and waits until it has been scheduled, hence the name.
     // eglWaitUntilWorkScheduledANGLE only has an effect on CGL and Metal backends, so we only use it on macOS.
 #    if defined(AK_OS_MACOS)
-    if (m_impl->uses_cpu_painting_surface)
-        glFinish();
-    else
-        eglWaitUntilWorkScheduledANGLE(m_impl->display);
+    eglWaitUntilWorkScheduledANGLE(m_impl->display);
 #    elif defined(USE_VULKAN_DMABUF_IMAGES)
     // FIXME: CPU sync for now, but it would be better to export a fence and have Skia wait for it before reading from the surface
     glFinish();
-#    elif (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(AK_OS_WINDOWS)
-    glFinish();
 #    endif
+#endif
+}
 
-#    if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
-    if (m_impl->uses_cpu_painting_surface)
-        copy_default_framebuffer_to_cpu_painting_surface();
-#    endif
+bool OpenGLContext::present_asynchronously()
+{
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    // Reading the frame back into client memory would block the Compositor until the GPU has finished it. A pixel pack
+    // buffer (which needs OpenGL ES 3, so WebGL 2) lets the GPU make the copy, to be picked up once the frame is needed.
+    if (m_impl->uses_cpu_painting_surface && m_webgl_version == WebGLVersion::WebGL2) {
+        make_current();
+        if (!m_impl->readback_buffer)
+            glGenBuffers(1, &m_impl->readback_buffer);
+        if (m_impl->readback_buffer_size != m_size) {
+            GLint original_pixel_pack_buffer = 0;
+            glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, m_impl->readback_buffer);
+            glBufferData(GL_PIXEL_PACK_BUFFER, static_cast<GLsizeiptr>(m_size.width()) * m_size.height() * 4, nullptr, GL_STREAM_READ);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
+            m_impl->readback_buffer_size = m_size;
+        }
+        read_default_framebuffer(m_impl->readback_buffer, nullptr);
+        glFlush();
+        m_impl->readback_pending = true;
+        return true;
+    }
+#endif
+    present();
+    return false;
+}
+
+void OpenGLContext::finish_asynchronous_present()
+{
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    if (!m_impl->readback_pending)
+        return;
+    m_impl->readback_pending = false;
+    make_current();
+    VERIFY(m_painting_surface);
+
+    auto& bitmap = readback_bitmap();
+    auto row_size = static_cast<size_t>(m_size.width()) * 4;
+
+    GLint original_pixel_pack_buffer = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, m_impl->readback_buffer);
+
+    // Mapping the buffer waits for the copy into it, if the GPU hasn't made it yet.
+    auto const* pixels = static_cast<u8 const*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, static_cast<GLsizeiptr>(row_size) * m_size.height(), GL_MAP_READ_BIT));
+    if (pixels) {
+        // GL's rows go from bottom to top, so flip them on the way into the bitmap.
+        for (int source_y = 0; source_y < m_size.height(); ++source_y)
+            memcpy(bitmap.scanline_u8(m_size.height() - source_y - 1), pixels + source_y * row_size, row_size);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
+
+    if (!pixels) {
+        dbgln("Compositor: Could not map the buffer a WebGL frame was read back into");
+        return;
+    }
+    m_painting_surface->write_from_bitmap(bitmap);
 #endif
 }
 
@@ -658,6 +1737,9 @@ u32 OpenGLContext::default_renderbuffer() const
 
 u32 OpenGLContext::default_framebuffer() const
 {
+    // The page draws into the multisampled framebuffer, when there is one.
+    if (m_impl->msaa_framebuffer)
+        return m_impl->msaa_framebuffer;
     return m_impl->framebuffer;
 }
 

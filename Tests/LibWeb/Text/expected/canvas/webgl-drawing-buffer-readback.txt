@@ -1,0 +1,13 @@
+webgl rows from the top: 200,160,120,80,40
+webgl2 rows from the top: 200,160,120,80,40
+webgl rows from the top, with the page's state set: 80,40
+webgl PACK_ALIGNMENT: 8
+webgl pixel read from the page's framebuffer: 0,255,0,255
+webgl error: NO_ERROR
+webgl2 rows from the top, with the page's state set: 80,40
+webgl2 PACK_ALIGNMENT: 8
+webgl2 PACK_ROW_LENGTH: 5
+webgl2 PACK_SKIP_PIXELS: 1
+webgl2 PACK_SKIP_ROWS: 1
+webgl2 pixel read from the page's framebuffer: 0,255,0,255
+webgl2 error: NO_ERROR

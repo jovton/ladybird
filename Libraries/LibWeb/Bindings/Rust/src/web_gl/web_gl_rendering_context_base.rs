@@ -138,7 +138,7 @@ impl<V: Version> RenderingContext<V> {
         if ContextState::is_context_lost(self) {
             return Ok(None);
         }
-        Ok(Some(self.actual_context_parameters))
+        Ok(Some(self.actual_context_parameters()))
     }
 
     pub(crate) fn is_context_lost(&self, _: &mut CallContext) -> WebIdlResult<bool> {

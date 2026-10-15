@@ -239,6 +239,7 @@ public:
     u64 keyboard_scroll_state_generation() const { return m_keyboard_scroll_state_generation; }
     void invalidate_compositor_wheel_event_listener_state();
     void invalidate_compositor_keyboard_scroll_state();
+    void did_change_system_focus();
     void invalidate_compositor_keyboard_scroll_state_for_document(DOM::Document const&);
     void keyboard_scroll_event_path_changed(DOM::EventTarget const&);
     void keyboard_scroll_dom_tree_changed(DOM::Node const&);

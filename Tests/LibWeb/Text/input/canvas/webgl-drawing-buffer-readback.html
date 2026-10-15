@@ -1,0 +1,91 @@
+<!doctype html>
+<script src="../include.js"></script>
+<script src="webgl-helpers.js"></script>
+<script>
+    // Paints each row of the drawing buffer a different color. GL counts rows from the bottom.
+    function paintRows(gl, width, height) {
+        gl.enable(gl.SCISSOR_TEST);
+        for (let y = 0; y < height; ++y) {
+            gl.scissor(0, y, width, 1);
+            gl.clearColor(((y + 1) * 40) / 255, 0, 1 - ((y + 1) * 40) / 255, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+        gl.disable(gl.SCISSOR_TEST);
+    }
+
+    // Drawing the canvas into a 2D canvas reads back its drawing buffer. Describes each row, from the top, by its red
+    // value, or as "mixed" if the row isn't a single color.
+    function rowsFromTheTop(glCanvas) {
+        const canvas = document.createElement("canvas");
+        canvas.width = glCanvas.width;
+        canvas.height = glCanvas.height;
+        const context = canvas.getContext("2d");
+        context.drawImage(glCanvas, 0, 0);
+
+        const rows = [];
+        for (let y = 0; y < canvas.height; ++y) {
+            const pixels = context.getImageData(0, y, canvas.width, 1).data;
+            const uniform = pixels.every((value, index) => value === pixels[index % 4]);
+            rows.push(uniform ? pixels[0] : "mixed");
+        }
+        return rows.join(",");
+    }
+
+    test(() => {
+        for (const version of ["webgl", "webgl2"]) {
+            const canvas = document.createElement("canvas");
+            canvas.width = 7;
+            canvas.height = 5;
+            const gl = canvas.getContext(version);
+            paintRows(gl, canvas.width, canvas.height);
+            println(`${version} rows from the top: ${rowsFromTheTop(canvas)}`);
+        }
+
+        // The readback must neither be affected by the page's framebuffer binding and pixel pack state, nor change them.
+        for (const version of ["webgl", "webgl2"]) {
+            const canvas = document.createElement("canvas");
+            canvas.width = 3;
+            canvas.height = 2;
+            const gl = canvas.getContext(version);
+            paintRows(gl, canvas.width, canvas.height);
+
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            const framebuffer = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+            gl.clearColor(0, 1, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            // With 3 pixels per row, an alignment of 8 pads each row, and the WebGL 2 parameters move the rows apart.
+            gl.pixelStorei(gl.PACK_ALIGNMENT, 8);
+            if (version === "webgl2") {
+                gl.pixelStorei(gl.PACK_ROW_LENGTH, 5);
+                gl.pixelStorei(gl.PACK_SKIP_PIXELS, 1);
+                gl.pixelStorei(gl.PACK_SKIP_ROWS, 1);
+                gl.bindBuffer(gl.PIXEL_PACK_BUFFER, gl.createBuffer());
+                gl.bufferData(gl.PIXEL_PACK_BUFFER, 256, gl.STREAM_READ);
+            }
+
+            println(`${version} rows from the top, with the page's state set: ${rowsFromTheTop(canvas)}`);
+
+            println(`${version} PACK_ALIGNMENT: ${gl.getParameter(gl.PACK_ALIGNMENT)}`);
+            gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
+            if (version === "webgl2") {
+                println(`${version} PACK_ROW_LENGTH: ${gl.getParameter(gl.PACK_ROW_LENGTH)}`);
+                println(`${version} PACK_SKIP_PIXELS: ${gl.getParameter(gl.PACK_SKIP_PIXELS)}`);
+                println(`${version} PACK_SKIP_ROWS: ${gl.getParameter(gl.PACK_SKIP_ROWS)}`);
+                gl.pixelStorei(gl.PACK_ROW_LENGTH, 0);
+                gl.pixelStorei(gl.PACK_SKIP_PIXELS, 0);
+                gl.pixelStorei(gl.PACK_SKIP_ROWS, 0);
+                gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+            }
+
+            const pixel = new Uint8Array(4);
+            gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+            println(`${version} pixel read from the page's framebuffer: ${pixel}`);
+            println(`${version} error: ${errorName(gl, gl.getError())}`);
+        }
+    });
+</script>

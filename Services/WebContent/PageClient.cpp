@@ -205,6 +205,8 @@ void PageClient::set_has_focus(bool has_focus)
         if (document->has_committed_viewport_box())
             document->paint_state().invalidate_all_cached_paint(*document);
     }
+
+    page().did_change_system_focus();
 }
 
 void PageClient::set_window_handle(Utf16String window_handle)

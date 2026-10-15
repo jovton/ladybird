@@ -84,6 +84,8 @@ struct SeatbeltProfile {
 #if defined(AK_OS_LINUX)
 [[nodiscard]] ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access);
 [[nodiscard]] ErrorOr<void> add_loaded_library_directories(Vector<LandlockPath>& paths, Optional<StringView> root = {});
+// Allows reading fontconfig's configuration (not the fonts it lists), which decides how glyphs are hinted.
+[[nodiscard]] ErrorOr<void> add_fontconfig_configuration_paths(Vector<LandlockPath>& paths);
 [[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> = {});
 #endif
 

@@ -138,8 +138,11 @@ pub(crate) struct ContextState {
     #[gc(untraced)]
     pub(crate) context_creation_parameters: WebGLContextAttributes,
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#actual-context-parameters
+    /// What the drawing buffer really got, set each time it is created. It can lack a stencil buffer that the page
+    /// asked for, see OpenGLContext::drawing_buffer_can_have_stencil() in the Compositor, and only WebGL 2 drawing
+    /// buffers are antialiased.
     #[gc(untraced)]
-    pub(crate) actual_context_parameters: WebGLContextAttributes,
+    actual_context_parameters: Cell<WebGLContextAttributes>,
     #[gc(untraced)]
     pub(crate) supported_opengl_extensions: RefCell<Vec<Vec<u8>>>,
 
@@ -200,6 +203,7 @@ pub(crate) struct ContextParameters {
     pub(crate) realm: Gc<Realm>,
     pub(crate) canvas: Canvas,
     pub(crate) context_attributes: WebGLContextAttributes,
+    pub(crate) actual_context_attributes: WebGLContextAttributes,
     pub(crate) supported_opengl_extensions: Vec<Vec<u8>>,
 }
 
@@ -216,7 +220,7 @@ impl ContextState {
             canvas_cell,
             canvas: parameters.canvas,
             context_creation_parameters: parameters.context_attributes,
-            actual_context_parameters: parameters.context_attributes,
+            actual_context_parameters: Cell::new(parameters.actual_context_attributes),
             supported_opengl_extensions: RefCell::new(parameters.supported_opengl_extensions),
             error: Cell::new(GL_NO_ERROR),
             context_lost: Cell::new(false),
@@ -411,9 +415,19 @@ impl ContextState {
         self.context_lost.get() && self.context_restore_requested.get()
     }
 
+    pub(crate) fn actual_context_parameters(&self) -> WebGLContextAttributes {
+        self.actual_context_parameters.get()
+    }
+
     /// The new replayer context has no GL objects: the page creates its objects anew once told of the restore.
-    pub(crate) fn restore(&self, transport: CppTransport, supported_opengl_extensions: Vec<Vec<u8>>) {
+    pub(crate) fn restore(
+        &self,
+        transport: CppTransport,
+        actual_context_attributes: WebGLContextAttributes,
+        supported_opengl_extensions: Vec<Vec<u8>>,
+    ) {
         self.proxy.restore(transport);
+        self.actual_context_parameters.set(actual_context_attributes);
         self.supported_opengl_extensions.replace(supported_opengl_extensions);
 
         self.context_generation.set(self.context_generation.get() + 1);
